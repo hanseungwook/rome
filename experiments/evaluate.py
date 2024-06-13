@@ -10,6 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from baselines.efk import EFKHyperParams, EfkRewriteExecutor
 from baselines.ft import FTHyperParams, apply_ft_to_model
+from baselines.dpo import DPOHyperParams, apply_dpo_to_model
 from baselines.kn import KNHyperParams, apply_kn_to_model
 from baselines.mend import MENDHyperParams, MendRewriteExecutor
 from dsets import (
@@ -27,6 +28,7 @@ from util.globals import *
 ALG_DICT = {
     "ROME": (ROMEHyperParams, apply_rome_to_model),
     "FT": (FTHyperParams, apply_ft_to_model),
+    "DPO": (DPOHyperParams, apply_dpo_to_model),
     "KN": (KNHyperParams, apply_kn_to_model),
     "MEND": (MENDHyperParams, MendRewriteExecutor().apply_to_model),
     "KE": (EFKHyperParams, EfkRewriteExecutor().apply_to_model),
@@ -100,9 +102,16 @@ def main(
 
     ds_class, ds_eval_method = DS_DICT[ds_name]
     ds = ds_class(DATA_DIR, size=dataset_size_limit, tok=tok)
-
+    
+    
+    counter = 0
     # Iterate through dataset
     for record in ds:
+        counter += 1
+        print("Counter: ", counter)
+        if counter <= 1:
+            continue
+        
         case_id = record["case_id"]
         case_result_path = run_dir / f"case_{case_id}.json"
         if not case_result_path.exists():
@@ -152,7 +161,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--alg_name",
-        choices=["ROME", "FT", "KN", "MEND", "KE"],
+        choices=["ROME", "FT", "DPO", "KN", "MEND", "KE"],
         default="ROME",
         help="Editing algorithm to use. Results are saved in results/<alg_name>/<run_id>, "
         "where a new run_id is generated on each run. "

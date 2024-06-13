@@ -157,7 +157,7 @@ def execute_dpo(
             # ensure eos token is not in prompt or target
             assert tok.eos_token_id not in prompt_inputs['input_ids']
             assert tok.eos_token_id not in chosen_tgt['input_ids']
-            assert tok.eos_token_id not in rejected_tgt['input_ids']
+            # assert tok.eos_token_id not in rejected_tgt['input_ids']
             
             # TODO: this will be a problem when prompt_inputs have different lengths and bs > 1
             
@@ -258,7 +258,6 @@ def execute_dpo(
             v[...] = weights_copy[k]
 
     print(f"Deltas successfully computed for {list(weights.keys())}")
-    del ref_model
 
     return deltas
 

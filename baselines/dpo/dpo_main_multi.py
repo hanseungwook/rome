@@ -37,9 +37,9 @@ def apply_dpo_to_model(
     if copy:
         model = deepcopy(model)
 
-    execute_dpo(accelerator, ref_model, model, opt, tok, requests, hparams)
+    loss, acc = execute_dpo(accelerator, ref_model, model, opt, tok, requests, hparams)
 
-    return
+    return loss, acc
 
 
 def execute_dpo(
@@ -96,7 +96,7 @@ def execute_dpo(
     # Convert the unique token ID tuples back to tensors
     gen_tgt = torch.stack([torch.tensor(o, dtype=torch.long) for o in unique_gen_ids], dim=0).to('cuda')
 
-    # Filter out generations that are the same as the new target
+    # Filter out generations that are the same as the new target -- remove this step and do this at the loss level (although less efficient, but allows for equal batch sizes on each GPU device)
     matches = [torch.equal(g, t) for g, t in zip(gen_tgt, chosen_tgt['input_ids'].repeat(gen_tgt.shape[0], 1))]
     gen_tgt = gen_tgt[~torch.tensor(matches)]
     if len(gen_tgt) == 0:
@@ -173,6 +173,7 @@ def execute_dpo(
 
     logits = current_logratios - ref_logratios
     # label_smoothing = 0 gives original DPO
+    # TODO: maybe implement length regularization here
     loss = -F.logsigmoid(hparams.beta * logits) * (1 - hparams.label_smoothing) - F.logsigmoid(-hparams.beta * logits) * hparams.label_smoothing
     loss = loss.mean()
     chosen_rewards = hparams.beta * (current_chosen_logp - ref_chosen_logp).detach()
@@ -180,26 +181,19 @@ def execute_dpo(
     reward_accuracies = (chosen_rewards > rejected_rewards).float().mean()
 
     opt.zero_grad()
-    
-    # TODO: fix chunk_bs if you generate more than 1 response
-    print(f"Batch loss {loss.item()}")
-    print(f'Reward accuracy {reward_accuracies.mean().item()}')
-    loss_meter.update(loss.item(), n=chunk_bs)
-    acc_meter.update(reward_accuracies.mean().item(), n=chunk_bs)
+    accelerator.backward(loss)
+    opt.step()
 
-    if loss.item() >= 1e-2:
-        loss.backward()
-        opt.step()
+    # TODO: skipping norm constraint 
+    # if type(hparams.norm_constraint) is float:
+    #     eps = hparams.norm_constraint
+    #     with torch.no_grad():
+    #         for k, v in weights.items():
+    #             v[...] = torch.clamp(
+    #                 v, min=weights_copy[k] - eps, max=weights_copy[k] + eps
+    #             )
 
-    if type(hparams.norm_constraint) is float:
-        eps = hparams.norm_constraint
-        with torch.no_grad():
-            for k, v in weights.items():
-                v[...] = torch.clamp(
-                    v, min=weights_copy[k] - eps, max=weights_copy[k] + eps
-                )
-
-return deltas
+    return loss, reward_accuracies.mean()
 
 
 def chunks(arr, n):
@@ -212,22 +206,3 @@ def chunks(arr, n):
             chunk = []
     if len(chunk) > 0:
         yield chunk
-
-
-class AverageMeter:
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count

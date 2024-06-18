@@ -7,7 +7,6 @@ from copy import deepcopy
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from accelerate import Accelerator
 from tqdm import tqdm
 
 from baselines.efk import EFKHyperParams, EfkRewriteExecutor
@@ -26,6 +25,8 @@ from experiments.py.eval_utils_zsre import compute_rewrite_quality_zsre
 from rome import ROMEHyperParams, apply_rome_to_model
 from util import nethook
 from util.globals import *
+from util.metrics import AverageMeter
+from util.distributed import *
 
 ALG_DICT = {
     "ROME": (ROMEHyperParams, apply_rome_to_model),
@@ -40,20 +41,6 @@ DS_DICT = {
     "cf": (CounterFactDataset, compute_rewrite_quality_counterfact),
     "zsre": (MENDQADataset, compute_rewrite_quality_zsre),
 }
-import torch.distributed as dist
-
-
-def setup_distributed_training(model, opt, tok, train_loader, mixed_precision):
-    # Initialize the distributed backend
-    dist.init_process_group(backend='nccl')
-
-    # Create an instance of the Accelerator class
-    accelerator = Accelerator(mixed_precision=mixed_precision)
-
-    # Set the device of the model and tokenizer
-    model, opt, tok, train_loader = accelerator.prepare(model, opt, tok, train_loader)
-
-    return accelerator, model, opt, tok, train_loader
 
 
 def main(
@@ -146,6 +133,10 @@ def main(
     # Call the setup_distributed_training function in the main function
     accelerator, model, opt, tok, train_loader = setup_distributed_training(model, tok, opt, train_loader, mixed_precision)
 
+    # Set up logging
+    if accelerator.is_local_main_process:
+        accelerator.init_trackers("knowledge_injection")
+
     # if algo is DPO, then create ref_model as a copy and wrap with accelerator
     ref_model = None
     if alg_name in ['DPO', 'FT']:
@@ -155,38 +146,54 @@ def main(
 
     loss_meter = AverageMeter()
     acc_meter = AverageMeter()
+    step = 0
 
     ##### Training loop #####
     for e in range(hparams.epochs):
+        model.train()
+
         # set up current run dir for the epoch
         if accelerator.is_local_main_process:
             cur_run_dir = run_dir / f"epoch_{e}"
             cur_run_dir.mkdir(parents=True, exist_ok=True)
 
         # Iterate through dataset in batches
-        for batch in tqdm(train_loader, desc=f"Training Epoch {e+1}/{hparams.epochs}", disable=not accelerator.is_local_main_process):
-            # Compute weight changes + record weights that changed
-            args_conserve_memory = (
-                dict(return_orig_weights_device=("cpu" if conserve_memory else "cuda"))
-                if conserve_memory
-                else dict()
-            )
-            requested_rewrites = [record["requested_rewrite"] for record in batch]
-            apply_algo(
-                accelerator,
-                model,
-                ref_model,
-                tok,
-                requested_rewrites,
-                hparams,
-                copy=False,
-                return_orig_weights=True,
-                **args_conserve_memory,
-            )
+        with tqdm(total=len(train_loader), desc=f"Training Epoch {e+1}/{hparams.epochs}", disable=not accelerator.is_local_main_process) as pbar:
+            for batch in pbar:
+                # Compute weight changes + record weights that changed
+                args_conserve_memory = (
+                    dict(return_orig_weights_device=("cpu" if conserve_memory else "cuda"))
+                    if conserve_memory
+                    else dict()
+                )
+                requested_rewrites = [record["requested_rewrite"] for record in batch]
+                loss, acc = apply_algo(
+                    accelerator,
+                    model,
+                    ref_model,
+                    tok,
+                    requested_rewrites,
+                    hparams,
+                    copy=False,
+                    return_orig_weights=True,
+                    **args_conserve_memory,
+                )
+
+                # gather tensors and log
+                if accelerator.is_local_main_process:
+                    mean_loss = gather_tensors(loss).mean().item()
+                    mean_acc = gather_tensors(acc).mean().item()
+
+                    accelerator.log({'loss': mean_loss, 'acc': mean_acc}, step=step)
+                    pbar.set_postfix({'loss': mean_loss, 'acc': mean_acc})
+
+                    step += 1
 
         print("")
         # Execute evaluation suite over the whole training set, but only on the main process
         if accelerator.is_local_main_process:
+            model.eval()
+
             for record in tqdm(ds, desc="Evaluating"):
                 case_id = record["case_id"]
                 case_result_path = cur_run_dir / f"case_{case_id}.json"
@@ -203,6 +210,7 @@ def main(
                     with open(case_result_path, "w") as f:
                         json.dump(metrics, f, indent=1)
 
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

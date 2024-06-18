@@ -9,6 +9,8 @@ class DPOHyperParams(HyperParams):
     # Method
     layers: List[int]
     num_steps: int
+    epochs: int
+    num_negatives: int
     lr: float
     weight_decay: float
     kl_factor: float

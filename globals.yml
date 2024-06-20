@@ -1,6 +1,6 @@
 ---
   # Result files
-  RESULTS_DIR: "results"
+  RESULTS_DIR: "/shiv/seungwook/knowledge-injection/results"
 
   # Data files
   DATA_DIR: "data"

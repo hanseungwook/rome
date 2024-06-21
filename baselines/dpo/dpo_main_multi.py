@@ -1,10 +1,11 @@
 from copy import deepcopy
 from typing import Any, Dict, List, Tuple
+import re
 
 from accelerate import Accelerator
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
 from util import nethook
 
@@ -37,15 +38,15 @@ def apply_dpo_to_model(
     if copy:
         model = deepcopy(model)
 
-    loss, acc = execute_dpo(accelerator, ref_model, model, opt, tok, requests, hparams)
+    loss, acc = execute_dpo(accelerator, model, ref_model, opt, tok, requests, hparams)
 
     return loss, acc
 
 
 def execute_dpo(
     accelerator: Accelerator,
-    ref_model: AutoModelForCausalLM,
     model: AutoModelForCausalLM,
+    ref_model: AutoModelForCausalLM,
     opt: torch.optim.Optimizer,
     tok: AutoTokenizer,
     requests: List[Dict],
@@ -57,20 +58,29 @@ def execute_dpo(
     Invariant: model at beginning of function == model at end of function
     """
 
+    class StopSentenceCriteria(StoppingCriteria):
+        def __init__(self, tokenizer, sentence_endings=['.', '!', '?', ';', '<|endoftext|>']):
+            super().__init__()
+            self.tokenizer = tokenizer
+            self.sentence_endings = sentence_endings
+            self.sentence_endings_id = set(self.tokenizer.encode(ending)[0] for ending in sentence_endings)
+            
+        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+            print('input ids shape at crtieria', input_ids.shape)
+            last_token_id = set(input_ids[:, -1].cpu())
+
+            return not last_token_id.isdisjoint(self.sentence_endings_id)
+
     # Update target and print info
     requests = deepcopy(requests)
-    for request in requests:
-        if request["target_new"]["str"][0] != " ":
-            # Space required for correct tokenization
-            request["target_new"]["str"] = " " + request["target_new"]["str"]
-        print(
-            f"Executing FT algo for: "
-            f"[{request['prompt'].format(request['subject'])}] -> [{request['target_new']['str']}]"
-        )
+    requests['target_new']['str'] = [" " + r for r in requests['target_new']['str'] if r[0] != " "]
+    print('Executing algo for: ')
+    for i in range(len(requests['prompt'])):
+        print(f"[{requests['prompt'][i].format(requests['subject'][i])}] -> [{requests['target_new']['str'][i]}]")
 
     # Define inputs
-    texts = [r["prompt"].format(r["subject"]) for r in requests]
-    targets = [r["target_new"]["str"] for r in requests]
+    texts = [prompt.format(subject) for prompt, subject in zip(requests['prompt'], requests['subject'])]
+    targets = requests['target_new']['str']
     txt, tgt = texts, targets
 
     chunk_bs = len(txt)
@@ -78,31 +88,46 @@ def execute_dpo(
     chosen_tgt = tok(tgt, return_tensors="pt", padding=True).to("cuda")
 
     # nucleus sampling
-    gen = model.generate(input_ids=prompt_inputs['input_ids'], do_sample=True, top_p=0.95, top_k=50, num_return_sequences=hparams.num_negatives, max_length=10)
+    stop_crit = StopSentenceCriteria(tok)
+    gen = model.generate(input_ids=prompt_inputs['input_ids'], do_sample=True, top_p=0.95, top_k=50, num_return_sequences=hparams.num_negatives, max_new_tokens=20) # stopping_criteria=StoppingCriteriaList([stop_crit]))
     gen = gen.reshape(-1, hparams.num_negatives, gen.shape[1]) # reshape into (bs, num_negatives, seq_len)
     # greedy decoding
     # gen = model.generate(input_ids=prompt_inputs['input_ids'], max_length=10)
     
     # extract only responses (excluding prompt) and convert to tuple (for unique hashing)
-    gen_ids = [tuple(o[prompt_inputs['input_ids'].shape[1]:].tolist()) for o in gen]
-    gen_txt = [tok.decode(o, skip_special_tokens=True) for o in gen_ids]
-    print('PROMPT: ', txt)
-    print('CHOSEN: ', tgt)
-    print('GENERATED: ', gen_txt)
+    gen_ids = [tuple(o[:, prompt_inputs['input_ids'].shape[1]:].tolist()) for o in gen]
+    gen_txt = [tok.batch_decode(o, skip_special_tokens=True) for o in gen_ids]
+    for i in range(len(gen_txt)):
+        print('PROMPT: ', txt[i])
+        print('CHOSEN: ', tgt[i])
+        print('GENERATED: ', gen_txt[i])
+    
+    # truncate each substring after the first punctuation
+    def truncate_after_punctuation(list_of_s):
+        results = []
+        for s in list_of_s:
+            substrings = s.split()
+            trunc_pattern = re.compile(r'[^\w\s](.*)')
+            truncated_substrings = [re.split(trunc_pattern, substring)[0] for substring in substrings]
+            result = ' '.join(truncated_substrings)
+            results.append(result)
+
+        return results
+    trunc_gen_txt = [truncate_after_punctuation(s) for s in gen_txt]
+    
 
     # Use a set to filter out duplicates
-    unique_gen_ids = list(set(gen_ids))
+    # unique_gen_ids = list(set(gen_ids))
 
     # Convert the unique token ID tuples back to tensors
-    gen_tgt = torch.stack([torch.tensor(o, dtype=torch.long) for o in unique_gen_ids], dim=0).to('cuda')
+    # gen_tgt = torch.stack([torch.tensor(o, dtype=torch.long) for o in unique_gen_ids], dim=0).to('cuda')
 
     # Filter out generations that are the same as the new target -- remove this step and do this at the loss level (although less efficient, but allows for equal batch sizes on each GPU device)
-    matches = [torch.equal(g, t) for g, t in zip(gen_tgt, chosen_tgt['input_ids'].repeat(gen_tgt.shape[0], 1))]
-    gen_tgt = gen_tgt[~torch.tensor(matches)]
-    if len(gen_tgt) == 0:
-        print('No valid negative generations found!')
-        continue
+    # matches = [torch.equal(g, t) for g, t in zip(gen_tgt, chosen_tgt['input_ids'].repeat(gen_tgt.shape[0], 1))]
+    # gen_tgt = gen_tgt[~torch.tensor(matches)]
+    # TODO: do this filtering out at the loss level (where it's 0 b/c chosen == generated)
 
+    gen_tgt = gen[:, :, prompt_inputs['input_ids'].shape[1]:]
     rejected_tgt = {
         'input_ids': gen_tgt,
         'attention_mask': (gen_tgt != tok.eos_token_id).to('cuda') # pad_token_id == eos_token_id

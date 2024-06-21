@@ -12,7 +12,7 @@ def gather_tensors(value):
 
 def setup_distributed_training(model, opt, tok, train_loader, mixed_precision):
     # Initialize the distributed backend
-    dist.init_process_group(backend='nccl')
+    # dist.init_process_group(backend='nccl')
 
     # Create an instance of the Accelerator class
     accelerator = Accelerator(mixed_precision=mixed_precision, log_with="wandb")

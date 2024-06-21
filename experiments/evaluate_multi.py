@@ -96,6 +96,7 @@ def main(
         model = AutoModelForCausalLM.from_pretrained(model_name)
         tok = AutoTokenizer.from_pretrained(model_name)
         tok.pad_token = tok.eos_token
+        tok.pad_token_id = tok.eos_token_id
         tok.padding_side = "left" # for batch processing
     else:
         model, tok = model_name
@@ -131,7 +132,7 @@ def main(
     train_loader = torch.utils.data.DataLoader(ds, batch_size=hparams.batch_size, shuffle=True)
 
     # Call the setup_distributed_training function in the main function
-    accelerator, model, opt, tok, train_loader = setup_distributed_training(model, tok, opt, train_loader, mixed_precision)
+    accelerator, model, opt, tok, train_loader = setup_distributed_training(model, opt, tok, train_loader, mixed_precision)
 
     # Set up logging
     if accelerator.is_local_main_process:
@@ -159,20 +160,21 @@ def main(
 
         # Iterate through dataset in batches
         with tqdm(total=len(train_loader), desc=f"Training Epoch {e+1}/{hparams.epochs}", disable=not accelerator.is_local_main_process) as pbar:
-            for batch in pbar:
+            for batch in train_loader:
                 # Compute weight changes + record weights that changed
                 args_conserve_memory = (
                     dict(return_orig_weights_device=("cpu" if conserve_memory else "cuda"))
                     if conserve_memory
                     else dict()
                 )
-                requested_rewrites = [record["requested_rewrite"] for record in batch]
+                # requested_rewrites = [record["requested_rewrite"] for record in batch]
                 loss, acc = apply_algo(
                     accelerator,
                     model,
                     ref_model,
+                    opt,
                     tok,
-                    requested_rewrites,
+                    batch['requested_rewrite'],
                     hparams,
                     copy=False,
                     return_orig_weights=True,
@@ -185,13 +187,15 @@ def main(
                     mean_acc = gather_tensors(acc).mean().item()
 
                     accelerator.log({'loss': mean_loss, 'acc': mean_acc}, step=step)
-                    pbar.set_postfix({'loss': mean_loss, 'acc': mean_acc})
+                    loss_meter.update(mean_loss)
+                    acc_meter.update(mean_acc)
+                    pbar.set_postfix({'running loss': mean_loss, 'running acc': mean_acc})
 
                     step += 1
 
         print("")
         # Execute evaluation suite over the whole training set, but only on the main process
-        if accelerator.is_local_main_process:
+        if accelerator.is_local_main_process and (e + 1) % hparams.eval_int == 0:
             model.eval()
 
             for record in tqdm(ds, desc="Evaluating"):
@@ -209,11 +213,13 @@ def main(
                     # Dump metrics in .json
                     with open(case_result_path, "w") as f:
                         json.dump(metrics, f, indent=1)
+            
 
     accelerator.end_training()
 
 
 if __name__ == "__main__":
+    
     import argparse
 
     parser = argparse.ArgumentParser()

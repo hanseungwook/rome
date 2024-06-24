@@ -5,6 +5,7 @@ import re
 from accelerate import Accelerator
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
 from util import nethook
@@ -85,86 +86,87 @@ def execute_dpo(
 
     chunk_bs = len(txt)
     prompt_inputs = tok(txt, return_tensors="pt", padding=True).to("cuda")
-    chosen_tgt = tok(tgt, return_tensors="pt", padding=True).to("cuda")
+    # chosen_tgt = tok(tgt, return_tensors="pt", padding=True).to("cuda")
 
-    # nucleus sampling
-    stop_crit = StopSentenceCriteria(tok)
-    gen = model.generate(input_ids=prompt_inputs['input_ids'], do_sample=True, top_p=0.95, top_k=50, num_return_sequences=hparams.num_negatives, max_new_tokens=20) # stopping_criteria=StoppingCriteriaList([stop_crit]))
-    gen = gen.reshape(-1, hparams.num_negatives, gen.shape[1]) # reshape into (bs, num_negatives, seq_len)
-    # greedy decoding
-    # gen = model.generate(input_ids=prompt_inputs['input_ids'], max_length=10)
-    
-    # extract only responses (excluding prompt) and convert to tuple (for unique hashing)
-    gen_ids = [tuple(o[:, prompt_inputs['input_ids'].shape[1]:].tolist()) for o in gen]
-    gen_txt = [tok.batch_decode(o, skip_special_tokens=True) for o in gen_ids]
-    for i in range(len(gen_txt)):
-        print('PROMPT: ', txt[i])
-        print('CHOSEN: ', tgt[i])
-        print('GENERATED: ', gen_txt[i])
-    
-    # truncate each substring after the first punctuation
-    def truncate_after_punctuation(list_of_s):
-        results = []
-        for s in list_of_s:
-            substrings = s.split()
-            trunc_pattern = re.compile(r'[^\w\s](.*)')
-            truncated_substrings = [re.split(trunc_pattern, substring)[0] for substring in substrings]
-            result = ' '.join(truncated_substrings)
-            results.append(result)
+    chosen_tgt = [tok.encode(t, padding=False) + [tok.eos_token_id] for t in tgt]
+    chosen_tgt = [torch.tensor(t) for t in chosen_tgt]
+    chosen_tgt = pad_sequence(chosen_tgt, batch_first=True, padding_value=tok.pad_token_id)
 
-        return results
-    trunc_gen_txt = [truncate_after_punctuation(s) for s in gen_txt]
-    
+    # create attention mask for generated targets
+    eos_token_idxs = ((chosen_tgt == tok.eos_token_id).cumsum(dim=1).cumsum(dim=1) == 1).argsort(dim=1)[:, -1]
+    mask = torch.arange(chosen_tgt.shape[1]).expand(chosen_tgt.shape[0], chosen_tgt.shape[1]) <= eos_token_idxs.unsqueeze(1)
+    chosen_attention_mask = torch.ones_like(chosen_tgt, dtype=torch.long) * mask
 
-    # Use a set to filter out duplicates
-    # unique_gen_ids = list(set(gen_ids))
-
-    # Convert the unique token ID tuples back to tensors
-    # gen_tgt = torch.stack([torch.tensor(o, dtype=torch.long) for o in unique_gen_ids], dim=0).to('cuda')
-
-    # Filter out generations that are the same as the new target -- remove this step and do this at the loss level (although less efficient, but allows for equal batch sizes on each GPU device)
-    # matches = [torch.equal(g, t) for g, t in zip(gen_tgt, chosen_tgt['input_ids'].repeat(gen_tgt.shape[0], 1))]
-    # gen_tgt = gen_tgt[~torch.tensor(matches)]
-    # TODO: do this filtering out at the loss level (where it's 0 b/c chosen == generated)
-
-    gen_tgt = gen[:, :, prompt_inputs['input_ids'].shape[1]:]
-    rejected_tgt = {
-        'input_ids': gen_tgt,
-        'attention_mask': (gen_tgt != tok.eos_token_id).to('cuda') # pad_token_id == eos_token_id
+    chosen_tgt = {
+        'input_ids': chosen_tgt.to('cuda'),
+        'attention_mask': chosen_attention_mask.to('cuda'),
     }
 
-    # ensure eos token is not in prompt or target
-    assert tok.eos_token_id not in prompt_inputs['input_ids']
-    assert tok.eos_token_id not in chosen_tgt['input_ids']
-    # assert tok.eos_token_id not in rejected_tgt['input_ids']
+    # nucleus sampling -- gen = (bs * num_negatives, seq_len)
+    gen = model.generate(input_ids=prompt_inputs['input_ids'], do_sample=True, top_p=0.95, top_k=50, num_return_sequences=hparams.num_negatives, max_new_tokens=20)
     
-    # TODO: this will be a problem when prompt_inputs have different lengths and bs > 1
+    # extract only responses (excluding prompt) and convert to tuple (for unique hashing)
+    gen_ids = [tuple(o[prompt_inputs['input_ids'].shape[1]:].tolist()) for o in gen]
+    gen_txt = tok.batch_decode(gen_ids, skip_special_tokens=True)
+    
+    def truncate_at_first_punctuation(s):
+        # Define a regular expression pattern to match any punctuation
+        trunc_pattern = re.compile(r'[.!?;:\n]')
+        match = trunc_pattern.search(s)
+        
+        # If punctuation is found, truncate the string at that position
+        if match:
+            result = s[:match.start()+1]
+        else:
+            result = s  # No punctuation found, return the original string
+        
+        return result
+
+
+    trunc_gen_txt = list(map(truncate_at_first_punctuation, gen_txt))
+    # tokenize this truncated text, add eos token, and pad to longest length
+    gen_tgt = [tok.encode(t, padding=False) + [tok.eos_token_id] for t in trunc_gen_txt]
+    gen_tgt = [torch.tensor(t) for t in gen_tgt]
+    gen_tgt = pad_sequence(gen_tgt, batch_first=True, padding_value=tok.pad_token_id)
+    
+    for i in range(len(trunc_gen_txt)):
+        print('PROMPT: ', txt[i//hparams.num_negatives])
+        print('CHOSEN: ', tgt[i//hparams.num_negatives])
+        print('GENERATED: ', trunc_gen_txt[i])
+
+    # create attention mask for generated targets
+    eos_token_idxs = ((gen_tgt == tok.eos_token_id).cumsum(dim=1).cumsum(dim=1) == 1).argsort(dim=1)[:, -1]
+    mask = torch.arange(gen_tgt.shape[1]).expand(gen_tgt.shape[0], gen_tgt.shape[1]) <= eos_token_idxs.unsqueeze(1)
+    gen_attention_mask = torch.ones_like(gen_tgt, dtype=torch.long) * mask
+
+    rejected_tgt = {
+        'input_ids': gen_tgt.to('cuda'),
+        'attention_mask': gen_attention_mask.to('cuda'),
+    }
     
     bs = gen_tgt.shape[0]
 
-    # concatenate prompt with target and add eos token
+    # concatenate prompt with target (eos token already added)
     chosen_inputs = {
-        'input_ids': torch.cat([prompt_inputs['input_ids'], chosen_tgt['input_ids'], torch.full((chunk_bs, 1), tok.eos_token_id, device='cuda', dtype=torch.long)], dim=1),
-        'attention_mask': torch.cat([prompt_inputs['attention_mask'], chosen_tgt['attention_mask'], torch.ones((chunk_bs, 1), device='cuda', dtype=torch.long)], dim=1)
+        'input_ids': torch.cat([prompt_inputs['input_ids'], chosen_tgt['input_ids']], dim=1),
+        'attention_mask': torch.cat([prompt_inputs['attention_mask'], chosen_tgt['attention_mask']], dim=1)
     }
     rejected_inputs = {
-        'input_ids': torch.cat([prompt_inputs['input_ids'].repeat(bs, 1), rejected_tgt['input_ids'], torch.full((bs, 1), tok.eos_token_id, device='cuda', dtype=torch.long)], dim=1),
-        'attention_mask': torch.cat([prompt_inputs['attention_mask'].repeat(bs, 1), rejected_tgt['attention_mask'], torch.ones((bs, 1), device='cuda', dtype=torch.long)], dim=1)
+        'input_ids': torch.cat([prompt_inputs['input_ids'].repeat_interleave(hparams.num_negatives, dim=0), rejected_tgt['input_ids']], dim=1),
+        'attention_mask': torch.cat([prompt_inputs['attention_mask'].repeat_interleave(hparams.num_negatives, dim=0), rejected_tgt['attention_mask']], dim=1)
     }
 
-    prompt_lengths = prompt_inputs['attention_mask'].sum(dim=1)
-    chosen_seq_len = chosen_inputs['attention_mask'].shape[1]
-    rejected_seq_len = rejected_inputs['attention_mask'].shape[1]
-
-    # mask for prompt
-    chosen_prompt_mask = torch.arange(chosen_seq_len, device='cuda').expand(chunk_bs, chosen_seq_len) < prompt_lengths.unsqueeze(1)
-    rejected_prompt_mask = torch.arange(rejected_seq_len, device='cuda').expand(chunk_bs, rejected_seq_len) < prompt_lengths.unsqueeze(1)
+    prompt_lengths = prompt_inputs['attention_mask'].shape[1] # constant prompt length (because left-padded)
 
     # create labels for getting logprob
     chosen_labels = chosen_inputs['input_ids'].clone()
-    chosen_labels = chosen_labels.masked_fill(chosen_prompt_mask, -100).repeat(bs, 1) # repeat along bs do we need this?
+    # put -100 for prompt and padding
+    chosen_labels = chosen_labels.masked_fill(~chosen_inputs['attention_mask'].bool(), -100)
+    chosen_labels[:, :prompt_lengths] = -100
+
     rejected_labels = rejected_inputs['input_ids'].clone()
-    rejected_labels = rejected_labels.masked_fill(rejected_prompt_mask, -100)
+    rejected_labels = rejected_labels.masked_fill(~rejected_inputs['attention_mask'].bool(), -100)
+    rejected_labels[:, :prompt_lengths] = -100
 
     # get logits for chosen and rejected under current model
     current_chosen_logits = model(**chosen_inputs).logits
@@ -173,15 +175,11 @@ def execute_dpo(
         ref_chosen_logits = ref_model(**chosen_inputs).logits
         ref_rejected_logits = ref_model(**rejected_inputs).logits
 
-    # repeat chosen outputs to match batch size
-    if bs > 1:
-        current_chosen_logits = current_chosen_logits.repeat(bs, 1, 1)
-        ref_chosen_logits = ref_chosen_logits.repeat(bs, 1, 1) # TODO: do we need this?
-
+    # TODO: do this filtering out at the loss level (where it's 0 b/c chosen == generated)
     # get logp with the chosen and rejected labels
     chosen_logp_mask = chosen_labels != -100
     rejected_logp_mask = rejected_labels != -100
-    chosen_labels[chosen_labels == -100] = 0
+    chosen_labels[chosen_labels == -100] = 0 # dummy tokens
     rejected_labels[rejected_labels == -100] = 0
 
     current_chosen_logp = torch.gather(F.log_softmax(current_chosen_logits, dim=-1), 2, chosen_labels.unsqueeze(2)).squeeze(2)
@@ -193,12 +191,12 @@ def execute_dpo(
     ref_rejected_logp = torch.gather(F.log_softmax(ref_rejected_logits, dim=-1), 2, rejected_labels.unsqueeze(2)).squeeze(2)
     ref_rejected_logp = (ref_rejected_logp * rejected_logp_mask).sum(-1)
 
-    current_logratios = current_chosen_logp - current_rejected_logp
-    ref_logratios = ref_chosen_logp - ref_rejected_logp
+    current_logratios = current_chosen_logp.unsqueeze(1) - current_rejected_logp.reshape(-1, hparams.num_negatives)
+    ref_logratios = ref_chosen_logp.unsqueeze(1) - ref_rejected_logp.reshape(-1, hparams.num_negatives)
 
     logits = current_logratios - ref_logratios
     # label_smoothing = 0 gives original DPO
-    # TODO: maybe implement length regularization here
+    # TODO: maybe implement length regularization here, maybe mask out zeros (chosen == rejected) in logratios
     loss = -F.logsigmoid(hparams.beta * logits) * (1 - hparams.label_smoothing) - F.logsigmoid(-hparams.beta * logits) * hparams.label_smoothing
     loss = loss.mean()
     chosen_rewards = hparams.beta * (current_chosen_logp - ref_chosen_logp).detach()
@@ -218,7 +216,11 @@ def execute_dpo(
     #                 v, min=weights_copy[k] - eps, max=weights_copy[k] + eps
     #             )
 
-    return loss, reward_accuracies.mean()
+    return {'loss': loss, 
+            'reward_acc': reward_accuracies.mean(),
+            'chosen_reward': chosen_rewards.mean(),
+            'rejected_reward': rejected_rewards.mean(),
+            }
 
 
 def chunks(arr, n):

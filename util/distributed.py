@@ -3,11 +3,15 @@ import torch.distributed as dist
 from accelerate import Accelerator
 
 
-def gather_tensors(value):
+def gather_tensors_in_dict(tensor_dict):
     world_size = dist.get_world_size()
-    gathered_values = [torch.zeros_like(value) for _ in range(world_size)]
-    dist.all_gather(gathered_values, value)
-    return gathered_values
+    gathered_dict = {}
+    for key, value in tensor_dict.items():
+        gathered_values = [torch.zeros_like(value) for _ in range(world_size)]
+        dist.all_gather(gathered_values, value)
+        gathered_dict[key] = gathered_values
+        
+    return gathered_dict
 
 
 def setup_distributed_training(model, opt, tok, train_loader, mixed_precision):

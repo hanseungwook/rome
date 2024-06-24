@@ -145,8 +145,14 @@ def main(
         accelerator.prepare(ref_model)
         ref_model.eval()
 
-    loss_meter = AverageMeter()
-    acc_meter = AverageMeter()
+    meters = None
+    if alg_name in ['DPO']:
+        meters = {'loss': AverageMeter(), 'acc': AverageMeter()}
+    elif alg_name in ['FT']:
+        meters = {'loss': AverageMeter}
+    else:
+        raise ValueError(f"Algorithm metrics {alg_name} not supported or implemented.")
+
     step = 0
 
     ##### Training loop #####
@@ -168,7 +174,7 @@ def main(
                     else dict()
                 )
                 # requested_rewrites = [record["requested_rewrite"] for record in batch]
-                loss, acc = apply_algo(
+                log_dict = apply_algo(
                     accelerator,
                     model,
                     ref_model,
@@ -183,13 +189,16 @@ def main(
 
                 # gather tensors and log
                 if accelerator.is_local_main_process:
-                    mean_loss = gather_tensors(loss).mean().item()
-                    mean_acc = gather_tensors(acc).mean().item()
-
-                    accelerator.log({'loss': mean_loss, 'acc': mean_acc}, step=step)
-                    loss_meter.update(mean_loss)
-                    acc_meter.update(mean_acc)
-                    pbar.set_postfix({'running loss': mean_loss, 'running acc': mean_acc})
+                    gathered_log_dict = gather_tensors_in_dict(log_dict)
+                    for k, v in gathered_log_dict.items():
+                        accelerator.log({k: v.mean().item()}, step=step)
+                    
+                    # update meters
+                    for k, v in metrics:
+                        if k in gathered_log_dict:
+                            meters[k].update(gathered_log_dict[k].mean().item())
+                        
+                    pbar.set_postfix({f'running {k}': v.avg for k, v in meters.items()})
 
                     step += 1
 

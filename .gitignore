@@ -1,4 +1,5 @@
 # Pipeline dumps, data directory
+wandb
 results
 data
 *_tmp_*_.json

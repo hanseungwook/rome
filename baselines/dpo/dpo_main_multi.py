@@ -39,9 +39,9 @@ def apply_dpo_to_model(
     if copy:
         model = deepcopy(model)
 
-    loss, acc = execute_dpo(accelerator, model, ref_model, opt, tok, requests, hparams)
+    log_dict = execute_dpo(accelerator, model, ref_model, opt, tok, requests, hparams)
 
-    return loss, acc
+    return log_dict
 
 
 def execute_dpo(
@@ -58,19 +58,6 @@ def execute_dpo(
     Executes the DPO update algorithm for the specified update at the specified layer
     Invariant: model at beginning of function == model at end of function
     """
-
-    class StopSentenceCriteria(StoppingCriteria):
-        def __init__(self, tokenizer, sentence_endings=['.', '!', '?', ';', '<|endoftext|>']):
-            super().__init__()
-            self.tokenizer = tokenizer
-            self.sentence_endings = sentence_endings
-            self.sentence_endings_id = set(self.tokenizer.encode(ending)[0] for ending in sentence_endings)
-            
-        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-            print('input ids shape at crtieria', input_ids.shape)
-            last_token_id = set(input_ids[:, -1].cpu())
-
-            return not last_token_id.isdisjoint(self.sentence_endings_id)
 
     # Update target and print info
     requests = deepcopy(requests)
@@ -101,9 +88,15 @@ def execute_dpo(
         'input_ids': chosen_tgt.to('cuda'),
         'attention_mask': chosen_attention_mask.to('cuda'),
     }
-
-    # nucleus sampling -- gen = (bs * num_negatives, seq_len)
-    gen = model.generate(input_ids=prompt_inputs['input_ids'], do_sample=True, top_p=0.95, top_k=50, num_return_sequences=hparams.num_negatives, max_new_tokens=20)
+    
+    # unwrap model and generate from it
+    with torch.no_grad():
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.eval()
+        # nucleus sampling -- gen = (bs * num_negatives, seq_len)
+        gen = unwrapped_model.generate(input_ids=prompt_inputs['input_ids'], do_sample=True, top_p=0.95, top_k=50, num_return_sequences=hparams.num_negatives, max_new_tokens=20)
+        unwrapped_model.train()
+        model.train()
     
     # extract only responses (excluding prompt) and convert to tuple (for unique hashing)
     gen_ids = [tuple(o[prompt_inputs['input_ids'].shape[1]:].tolist()) for o in gen]
@@ -129,10 +122,10 @@ def execute_dpo(
     gen_tgt = [torch.tensor(t) for t in gen_tgt]
     gen_tgt = pad_sequence(gen_tgt, batch_first=True, padding_value=tok.pad_token_id)
     
-    for i in range(len(trunc_gen_txt)):
-        print('PROMPT: ', txt[i//hparams.num_negatives])
-        print('CHOSEN: ', tgt[i//hparams.num_negatives])
-        print('GENERATED: ', trunc_gen_txt[i])
+    # for i in range(len(trunc_gen_txt)):
+    #     print('PROMPT: ', txt[i//hparams.num_negatives])
+    #     print('CHOSEN: ', tgt[i//hparams.num_negatives])
+    #     print('GENERATED: ', trunc_gen_txt[i])
 
     # create attention mask for generated targets
     eos_token_idxs = ((gen_tgt == tok.eos_token_id).cumsum(dim=1).cumsum(dim=1) == 1).argsort(dim=1)[:, -1]
@@ -199,13 +192,15 @@ def execute_dpo(
     # TODO: maybe implement length regularization here, maybe mask out zeros (chosen == rejected) in logratios
     loss = -F.logsigmoid(hparams.beta * logits) * (1 - hparams.label_smoothing) - F.logsigmoid(-hparams.beta * logits) * hparams.label_smoothing
     loss = loss.mean()
-    chosen_rewards = hparams.beta * (current_chosen_logp - ref_chosen_logp).detach()
+    chosen_rewards = hparams.beta * (current_chosen_logp - ref_chosen_logp).detach().repeat_interleave(hparams.num_negatives, dim=0)
     rejected_rewards = hparams.beta * (current_rejected_logp - ref_rejected_logp).detach()
     reward_accuracies = (chosen_rewards > rejected_rewards).float().mean()
 
+    print('calculating loss')
     opt.zero_grad()
     accelerator.backward(loss)
     opt.step()
+    print('step')
 
     # TODO: skipping norm constraint 
     # if type(hparams.norm_constraint) is float:

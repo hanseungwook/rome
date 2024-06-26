@@ -10,6 +10,8 @@ import torch
 import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
+import accelerate
+from accelerate.utils import set_seed
 
 # from baselines.efk import EFKHyperParams, EfkRewriteExecutor
 from baselines.ft import FTHyperParams, apply_ft_to_model
@@ -44,8 +46,6 @@ DS_DICT = {
     "zsre": (MENDQADataset, compute_rewrite_quality_zsre),
 }
 
-torch.autograd.set_detect_anomaly(True)
-
 def main(
     alg_name: str,
     model_name: Union[str, Tuple],
@@ -68,20 +68,29 @@ def main(
             run_dir.exists()
         ), f"If continuing from run, {continue_from_run} must exist!"
     else:
-        alg_dir = RESULTS_DIR / dir_name
-        if alg_dir.exists():
-            id_list = [
-                int(str(x).split("_")[-1])
-                for x in alg_dir.iterdir()
-                if str(x).split("_")[-1].isnumeric()
-            ]
-            run_id = 0 if not id_list else max(id_list) + 1
+        if is_main_process():
+            alg_dir = RESULTS_DIR / dir_name
+            if alg_dir.exists():
+                id_list = [
+                    int(str(x).split("_")[-1])
+                    for x in alg_dir.iterdir()
+                    if str(x).split("_")[-1].isnumeric()
+                ]
+                run_id = 0 if not id_list else max(id_list) + 1
+            else:
+                run_id = 0
+            run_dir = RESULTS_DIR / dir_name / f"run_{str(run_id).zfill(3)}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Results will be stored at {run_dir}") if is_main_process() else None
+
+            # checkpoint directory
+            checkpoint_dir = run_dir / "checkpoints"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Checkpoints will be stored at {checkpoint_dir}") if is_main_process() else None
         else:
-            run_id = 0
-        run_dir = RESULTS_DIR / dir_name / f"run_{str(run_id).zfill(3)}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"Results will be stored at {run_dir}") if is_main_process() else None
+            run_dir = None
+            checkpoint_dir = None
+
 
     # Get run hyperparameters
     params_path = (
@@ -90,8 +99,13 @@ def main(
         else HPARAMS_DIR / alg_name / hparams_fname
     )
     hparams = params_class.from_json(params_path)
-    if not (run_dir / "params.json").exists():
-        shutil.copyfile(params_path, run_dir / "params.json")
+
+    # Set seed
+    set_seed(hparams.seed)
+    
+    if is_main_process():
+        if not (run_dir / "params.json").exists():
+            shutil.copyfile(params_path, run_dir / "params.json")
 
     print(f"Executing {alg_name} with parameters {hparams}") if is_main_process() else None
 
@@ -117,13 +131,14 @@ def main(
     print(f"Weights to be updated: {list(weights.keys())}") if is_main_process() else None
 
     # Configure optimizer / gradients
-    opt = torch.optim.Adam(
-        [v for _, v in weights.items()],
-        lr=hparams.lr,
-        weight_decay=hparams.weight_decay,
-    )
-    for name, w in model.named_parameters():
-        w.requires_grad = name in weights
+    # opt = torch.optim.Adam(
+    #     [v for _, v in weights.items()],
+    #     lr=hparams.lr,
+    #     weight_decay=hparams.weight_decay,
+    # )
+
+    # for name, w in model.named_parameters():
+        # w.requires_grad = name in weights
 
     # Load data
     print("Loading dataset, attribute snippets, tf-idf data") if is_main_process() else None
@@ -138,7 +153,22 @@ def main(
     eval_loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False)
 
     # Call the setup_distributed_training function in the main function
-    accelerator, model, opt, tok, train_loader, eval_loader = setup_distributed_training(model, opt, tok, train_loader, eval_loader)
+    accelerator, model, tok, train_loader, eval_loader = setup_distributed_training(model, tok, train_loader, eval_loader)
+
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=hparams.lr,
+        weight_decay=hparams.weight_decay,
+    )
+
+    opt = accelerator.prepare(opt)
+
+    # Sync run_dir name across processes
+    sync_run_dir = [run_dir, checkpoint_dir]
+    accelerate.utils.broadcast_object_list(sync_run_dir, from_process=0)
+    run_dir = sync_run_dir[0]
+    checkpoint_dir = sync_run_dir[1]
+    print(f'Synced dir names across processes: run_dir {run_dir}\tcheckpoint_dir {checkpoint_dir} ') if is_main_process() else None
 
     # Set up logging
     if accelerator.is_local_main_process:
@@ -146,10 +176,10 @@ def main(
 
     # if algo is DPO, then create ref_model as a copy and wrap with accelerator
     ref_model = None
-    if alg_name in ['DPO', 'FT']:
-        ref_model = AutoModelForCausalLM.from_pretrained(model_name)
-        accelerator.prepare(ref_model)
-        ref_model.eval()
+    # if alg_name in ['DPO', 'FT']:
+    #     ref_model = AutoModelForCausalLM.from_pretrained(model_name)
+    #     accelerator.prepare(ref_model)
+    #     ref_model.eval()
 
     meters = None
     if alg_name in ['DPO']:
@@ -165,53 +195,58 @@ def main(
     for e in range(hparams.epochs):
         model.train()
 
-        # # Iterate through dataset in batches
-        # with tqdm(total=len(train_loader), desc=f"Training Epoch {e+1}/{hparams.epochs}", disable=not accelerator.is_local_main_process) as pbar:
-        #     for batch in train_loader:
-        #         # Compute weight changes + record weights that changed
-        #         args_conserve_memory = (
-        #             dict(return_orig_weights_device=("cpu" if conserve_memory else "cuda"))
-        #             if conserve_memory
-        #             else dict()
-        #         )
-        #         # requested_rewrites = [record["requested_rewrite"] for record in batch]
-        #         log_dict = apply_algo(
-        #             accelerator,
-        #             model,
-        #             ref_model,
-        #             opt,
-        #             tok,
-        #             batch['requested_rewrite'],
-        #             hparams,
-        #             copy=False,
-        #             return_orig_weights=True,
-        #             **args_conserve_memory,
-        #         )
+        # Iterate through dataset in batches
+        with tqdm(total=len(train_loader), desc=f"Training Epoch {e+1}/{hparams.epochs}", disable=not accelerator.is_local_main_process) as pbar:
+            for batch in train_loader:
+                # Compute weight changes + record weights that changed
+                args_conserve_memory = (
+                    dict(return_orig_weights_device=("cpu" if conserve_memory else "cuda"))
+                    if conserve_memory
+                    else dict()
+                )
+                # requested_rewrites = [record["requested_rewrite"] for record in batch]
+                log_dict = apply_algo(
+                    accelerator,
+                    model,
+                    ref_model,
+                    opt,
+                    tok,
+                    batch['requested_rewrite'],
+                    hparams,
+                    copy=False,
+                    return_orig_weights=True,
+                    **args_conserve_memory,
+                )
 
-        #         # gather tensors and log
-        #         gathered_log_dict = gather_tensors_in_dict(log_dict)
+                # gather tensors and log
+                gathered_log_dict = gather_tensors_in_dict(log_dict)
                 
-        #         if accelerator.is_local_main_process:
-        #             for k, v in gathered_log_dict.items():
-        #                 accelerator.log({k: v.mean().item()}, step=step)
+                if accelerator.is_local_main_process:
+                    for k, v in gathered_log_dict.items():
+                        accelerator.log({k: v.mean().item()}, step=step)
                     
-        #             # update meters
-        #             for k, meter in meters.items():
-        #                 if k in gathered_log_dict:
-        #                     meter.update(gathered_log_dict[k].mean().item())
+                    # update meters
+                    for k, meter in meters.items():
+                        if k in gathered_log_dict:
+                            meter.update(gathered_log_dict[k].mean().item())
 
-        #             pbar.update(1)    
-        #             pbar.set_postfix({f'running {k}': v.avg for k, v in meters.items()})
+                    pbar.update(1)    
+                    pbar.set_postfix({f'running {k}': v.avg for k, v in meters.items()})
                     
-        #             step += 1
+                    step += 1
 
-        print("")
+        # if (e + 1) % hparams.save_int == 0:
+        #     # save checkpoint
+        #     print('Saving checkpoint...')
+        #     print('epoch is:', e+1)
+        #     print('rank is:', dist.get_rank())
+
+        #     accelerator.save_state(checkpoint_dir / f"epoch_{e+1}")
 
         # Execute evaluation suite over the whole training set, but only on the main process
         if (e + 1) % hparams.eval_int == 0:
             model.eval()
-            ref_model.eval()
-
+            # ref_model.eval()
             cur_run_dir = run_dir / f"epoch_{e}"
 
             # set up current run dir for the epoch
@@ -246,11 +281,10 @@ def main(
                         "requested_rewrite": batch["requested_rewrite"],
                         "post": ds_eval_method(model, tok, batch, snips, vec),
                     }
-                    metrics["pre"] = ds_eval_method(ref_model, tok, deepcopy(batch), snips, vec)
+                    # metrics["pre"] = ds_eval_method(ref_model, tok, deepcopy(batch), snips, vec)
                     
                     eval_results.append(metrics)
-                    gathered_eval_results = accelerator.gather_for_metrics(eval_results)
-
+                    gathered_eval_results = accelerator.gather_for_metrics(eval_results, use_gather_object=True)
                     if accelerator.is_local_main_process:
                         for metrics in gathered_eval_results:
                             if isinstance(metrics['case_id'], torch.Tensor):

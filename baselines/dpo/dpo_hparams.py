@@ -11,6 +11,7 @@ class DPOHyperParams(HyperParams):
     num_steps: int
     epochs: int
     eval_int: int
+    save_int: int
     num_negatives: int
     lr: float
     weight_decay: float
@@ -34,5 +35,8 @@ class DPOHyperParams(HyperParams):
     ln_f_module: str
     lm_head_module: str
 
+    seed: int
+
     # Defaults
     batch_size: int = 128
+    

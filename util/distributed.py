@@ -1,10 +1,18 @@
+import os
+
 import torch
 import torch.distributed as dist
 from accelerate import Accelerator
 
 
 def is_main_process():
-    return not dist.is_initialized() or dist.get_rank() == 0
+    if not dist.is_initialized():
+        if 'RANK' in os.environ:
+            return int(os.environ['RANK']) == 0
+        else:
+            return True
+    else:
+        return dist.get_rank() == 0
 
 
 def gather_tensors_in_dict(tensor_dict):
@@ -18,7 +26,7 @@ def gather_tensors_in_dict(tensor_dict):
     return gathered_dict
 
 
-def setup_distributed_training(model, opt, tok, train_loader, eval_loader):
+def setup_distributed_training(model, tok, train_loader, eval_loader):
     # Initialize the distributed backend
     # dist.init_process_group(backend='nccl')
 
@@ -26,6 +34,6 @@ def setup_distributed_training(model, opt, tok, train_loader, eval_loader):
     accelerator = Accelerator(log_with="wandb")
 
     # Set the device of the model and tokenizer
-    model, opt, tok, train_loader, eval_loader = accelerator.prepare(model, opt, tok, train_loader, eval_loader)
+    model, tok, train_loader, eval_loader = accelerator.prepare(model, tok, train_loader, eval_loader)
 
-    return accelerator, model, opt, tok, train_loader, eval_loader
+    return accelerator, model, tok, train_loader, eval_loader

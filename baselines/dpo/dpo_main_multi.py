@@ -5,6 +5,7 @@ import re
 from accelerate import Accelerator
 import torch
 import torch.nn.functional as F
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
@@ -90,7 +91,7 @@ def execute_dpo(
     }
     
     # unwrap model and generate from it
-    with torch.no_grad():
+    with torch.no_grad() and FSDP.summon_full_params(model, recurse=False, writeback=False):
         unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_model.eval()
         # nucleus sampling -- gen = (bs * num_negatives, seq_len)
@@ -164,9 +165,9 @@ def execute_dpo(
     # get logits for chosen and rejected under current model
     current_chosen_logits = model(**chosen_inputs).logits
     current_rejected_logits = model(**rejected_inputs).logits
-    with torch.no_grad():
-        ref_chosen_logits = ref_model(**chosen_inputs).logits
-        ref_rejected_logits = ref_model(**rejected_inputs).logits
+    # with torch.no_grad() and FSDP.summon_full_params(ref_model, recurse=False, writeback=False):
+        # ref_chosen_logits = ref_model(**chosen_inputs).logits
+        # ref_rejected_logits = ref_model(**rejected_inputs).logits
 
     # TODO: do this filtering out at the loss level (where it's 0 b/c chosen == generated)
     # get logp with the chosen and rejected labels
@@ -179,14 +180,19 @@ def execute_dpo(
     current_chosen_logp = (current_chosen_logp * chosen_logp_mask).sum(-1)
     current_rejected_logp = torch.gather(F.log_softmax(current_rejected_logits, dim=-1), 2, rejected_labels.unsqueeze(2)).squeeze(2)
     current_rejected_logp = (current_rejected_logp * rejected_logp_mask).sum(-1)
-    ref_chosen_logp = torch.gather(F.log_softmax(ref_chosen_logits, dim=-1), 2, chosen_labels.unsqueeze(2)).squeeze(2)
-    ref_chosen_logp = (ref_chosen_logp * chosen_logp_mask).sum(-1)
-    ref_rejected_logp = torch.gather(F.log_softmax(ref_rejected_logits, dim=-1), 2, rejected_labels.unsqueeze(2)).squeeze(2)
-    ref_rejected_logp = (ref_rejected_logp * rejected_logp_mask).sum(-1)
+    # ref_chosen_logp = torch.gather(F.log_softmax(ref_chosen_logits, dim=-1), 2, chosen_labels.unsqueeze(2)).squeeze(2)
+    # ref_chosen_logp = (ref_chosen_logp * chosen_logp_mask).sum(-1)
+    # ref_rejected_logp = torch.gather(F.log_softmax(ref_rejected_logits, dim=-1), 2, rejected_labels.unsqueeze(2)).squeeze(2)
+    # ref_rejected_logp = (ref_rejected_logp * rejected_logp_mask).sum(-1)
 
     current_logratios = current_chosen_logp.unsqueeze(1) - current_rejected_logp.reshape(-1, hparams.num_negatives)
-    ref_logratios = ref_chosen_logp.unsqueeze(1) - ref_rejected_logp.reshape(-1, hparams.num_negatives)
+    # ref_logratios = ref_chosen_logp.unsqueeze(1) - ref_rejected_logp.reshape(-1, hparams.num_negatives)
 
+    if ref_model is None:
+        ref_logratios = 0.
+        ref_chosen_logp = 0.
+        ref_rejected_logp = 0.
+    
     logits = current_logratios - ref_logratios
     # label_smoothing = 0 gives original DPO
     # TODO: maybe implement length regularization here, maybe mask out zeros (chosen == rejected) in logratios
@@ -196,11 +202,9 @@ def execute_dpo(
     rejected_rewards = hparams.beta * (current_rejected_logp - ref_rejected_logp).detach()
     reward_accuracies = (chosen_rewards > rejected_rewards).float().mean()
 
-    print('calculating loss')
     opt.zero_grad()
     accelerator.backward(loss)
     opt.step()
-    print('step')
 
     # TODO: skipping norm constraint 
     # if type(hparams.norm_constraint) is float:

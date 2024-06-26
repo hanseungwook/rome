@@ -77,27 +77,27 @@ def compute_rewrite_quality_counterfact(
         )
     }
 
-    if snips is not None:
-        # Gather reference texts
-        rel_id = record["requested_rewrite"]["relation_id"]
-        consistency_texts = [x["text"] for x in snips[rel_id][target_new["id"]]]
-        essence_texts = [
-            x["text"]
-            for x in snips[rel_id][target_new["id"]]
-            if x["name"] == record["requested_rewrite"]["subject"]
-        ]
-        assert (
-            len(consistency_texts) > 0
-        ), "Must have consistency texts to evaluate generation"
-        gen_stats = test_generation(
-            model,
-            tok,
-            generation_prompts,
-            consistency_texts,
-            essence_texts,
-            vec,
-        )
-        ret.update(gen_stats)
+    # if snips is not None:
+    #     # Gather reference texts
+    #     rel_id = record["requested_rewrite"]["relation_id"]
+    #     consistency_texts = [x["text"] for x in snips[rel_id][target_new["id"]]]
+    #     essence_texts = [
+    #         x["text"]
+    #         for x in snips[rel_id][target_new["id"]]
+    #         if x["name"] == record["requested_rewrite"]["subject"]
+    #     ]
+    #     assert (
+    #         len(consistency_texts) > 0
+    #     ), "Must have consistency texts to evaluate generation"
+    #     gen_stats = test_generation(
+    #         model,
+    #         tok,
+    #         generation_prompts,
+    #         consistency_texts,
+    #         essence_texts,
+    #         vec,
+    #     )
+    #     ret.update(gen_stats)
 
     return ret
 
@@ -120,14 +120,14 @@ def test_batch_prediction(
         ],
         padding=True,
         return_tensors="pt",
-    ).to("cuda")
+    )#.to('cuda')
 
     a_tok, b_tok = (tok(f" {n}")["input_ids"] for n in [target_new, target_true])
     choice_a_len, choice_b_len = (len(n) for n in [a_tok, b_tok])
-
+    print('before fwd in test batch pred')
     with torch.no_grad():
         logits = model(**prompt_tok).logits
-
+    print('after fwd in test batch pred')
     results = np.zeros((logits.size(0),), dtype=np.float32)
 
     for i in range(logits.size(0)):

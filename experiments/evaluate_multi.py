@@ -112,8 +112,8 @@ def main(
     # Instantiate vanilla model
     print("Instantiating model") if is_main_process else None
     if type(model_name) is str:
-        model = AutoModelForCausalLM.from_pretrained(model_name)
-        tok = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name, token='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')
+        tok = AutoTokenizer.from_pretrained(model_name, token='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')
         tok.pad_token = tok.eos_token
         tok.pad_token_id = tok.eos_token_id
         tok.padding_side = "left" # for batch processing

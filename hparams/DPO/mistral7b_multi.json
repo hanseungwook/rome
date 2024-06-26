@@ -5,6 +5,7 @@
     "epochs": 30,
     "num_steps": 0,
     "eval_int": 2,
+    "save_int": 1,
     "beta": 0.1,
     "num_negatives": 32,
     "label_smoothing": 0.0,
@@ -18,5 +19,6 @@
     "mlp_module_tmp": "transformer.h.{}.mlp",
     "attn_module_tmp": "transformer.h.{}.attn",
     "ln_f_module": "transformer.ln_f",
-    "lm_head_module": "transformer.wte"
+    "lm_head_module": "transformer.wte",
+    "seed": 21
 }

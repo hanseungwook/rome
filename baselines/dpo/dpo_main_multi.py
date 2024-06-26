@@ -7,11 +7,24 @@ import torch
 import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from util import nethook
 
 from .dpo_hparams import DPOHyperParams
+
+class ModelWithRef(torch.nn.Module):
+    def __init__(self, model, ref_model):
+        super().__init__()
+        self.model = model
+        self.ref_model = ref_model
+
+    def forward(self, ref=False, *args, **kwargs):
+        if ref:
+            return self.ref_model(*args, **kwargs)
+        else:
+            return self.model(*args, **kwargs)
+
 
 def print_grad(opt):
     for group in opt.param_groups:

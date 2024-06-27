@@ -122,7 +122,11 @@ def test_batch_prediction(
         return_tensors="pt",
     )#.to('cuda')
 
-    a_tok, b_tok = (tok(f" {n}")["input_ids"] for n in [target_new, target_true])
+    if tok.add_bos_token:
+        a_tok, b_tok = (tok(f" {n}")["input_ids"][1:] for n in [target_new, target_true])
+    else:
+        a_tok, b_tok = (tok(f" {n}")["input_ids"] for n in [target_new, target_true])
+
     choice_a_len, choice_b_len = (len(n) for n in [a_tok, b_tok])
     with torch.no_grad():
         logits = model(**prompt_tok).logits

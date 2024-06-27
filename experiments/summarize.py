@@ -39,7 +39,7 @@ def main(
             if first_n_cases is not None and case_id >= first_n_cases:
                 break
 
-            cur_sum["time"].append(data["time"])
+            # cur_sum["time"].append(data["time"])
 
             for prefix in ["pre", "post"]:
                 # Probability metrics for which new should be lower (better) than true

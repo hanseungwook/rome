@@ -1,10 +1,7 @@
 {
-    "layers": [
-        1
-    ],
     "epochs": 30,
     "num_steps": 0,
-    "eval_int": 2,
+    "eval_int": 1,
     "save_int": 1,
     "beta": 0.1,
     "num_negatives": 32,
@@ -15,11 +12,6 @@
     "weight_decay": 0,
     "kl_factor": 0,
     "norm_constraint": false,
-    "rewrite_module_tmp": "transformer.h.{}",
-    "layer_module_tmp": "transformer.h.{}",
-    "mlp_module_tmp": "transformer.h.{}.mlp",
-    "attn_module_tmp": "transformer.h.{}.attn",
-    "ln_f_module": "transformer.ln_f",
-    "lm_head_module": "transformer.wte",
+    "use_ref": false,
     "seed": 21
 }

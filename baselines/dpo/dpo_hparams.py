@@ -7,7 +7,7 @@ from util.hparams import HyperParams
 @dataclass
 class DPOHyperParams(HyperParams):
     # Method
-    layers: List[int]
+    # layers: List[int]
     num_steps: int
     epochs: int
     eval_int: int
@@ -19,6 +19,7 @@ class DPOHyperParams(HyperParams):
     norm_constraint: float
     beta: float
     label_smoothing: float
+    use_ref: bool
 
     # Sampling parameters
     # num_samples: int
@@ -28,12 +29,12 @@ class DPOHyperParams(HyperParams):
     # max_len: int
 
     # Module templates
-    rewrite_module_tmp: str
-    layer_module_tmp: str
-    mlp_module_tmp: str
-    attn_module_tmp: str
-    ln_f_module: str
-    lm_head_module: str
+    # rewrite_module_tmp: str
+    # layer_module_tmp: str
+    # mlp_module_tmp: str
+    # attn_module_tmp: str
+    # ln_f_module: str
+    # lm_head_module: str
 
     seed: int
 

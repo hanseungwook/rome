@@ -126,13 +126,11 @@ def main(
     else:
         model, tok = model_name
 
-    # if algo is DPO, then create ref_model as a copy and wrap with accelerator
+    # if use_ref is True, then load reference model and wrap both models in 1 module
     ref_model = None
-    if alg_name in ['FT']:# ['DPO', 'FT']:
-        ref_model = AutoModelForCausalLM.from_pretrained(model_name)        
+    if hasattr(hparams, 'use_ref') and hparams.use_ref is True:
+        ref_model = AutoModelForCausalLM.from_pretrained(model_name)
         ref_model.eval()
-
-    if ref_model is not None:
         model = ModelWithRef(model, ref_model)
 
     if isinstance(model, ModelWithRef):
@@ -160,44 +158,15 @@ def main(
     train_loader = torch.utils.data.DataLoader(ds, batch_size=hparams.batch_size, shuffle=True)
     eval_loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False)
 
-    # # Capture the environment variables
-    # if is_main_process():
-    #     import os
-    #     import pickle
-    #     # Path to the pickle file
-    #     pickle_file_path = 'env_vars.pkl'
-
-    #     if not os.path.exists(pickle_file_path):
-    #         # Capture the environment variables
-    #         env_vars = dict(os.environ)
-            
-    #         # Save the environment variables to a pickle file
-    #         with open(pickle_file_path, 'wb') as f:
-    #             pickle.dump(env_vars, f)
-    #         print("Environment variables saved to env_vars.pkl")
-    #     else:
-    #         # Load the environment variables from the pickle file
-    #         with open(pickle_file_path, 'rb') as f:
-    #             loaded_env_vars = pickle.load(f)
-            
-    #         # Update os.environ with the loaded environment variables
-    #         os.environ.update(loaded_env_vars)
-    #         print("Environment variables loaded from env_vars.pkl")
-
-    #         # Verify that the environment variables have been loaded
-    #         for key, value in loaded_env_vars.items():
-    #             print(f'{key}: {value}')
-
     # Call the setup_distributed_training function in the main function
     accelerator, model, tok, train_loader, eval_loader = setup_distributed_training(model, tok, train_loader, eval_loader, hparams)
-    # torch.distributed.breakpoint()
 
     # Cast native autocast to generate function if using ModelWithRef
     if isinstance(model.module, ModelWithRef) and accelerator.mixed_precision in ('fp16', 'bf16'):
         model.module.generate = cast_with_native_amp(model.module.generate, accelerator.mixed_precision)
         model.model.generate = cast_with_native_amp(model.model.generate, accelerator.mixed_precision)
-        # model.generate = cast_with_native_amp(model.generate, accelerator.mixed_precision)
-        print('Casting amp to generate fn')
+    else:
+        model.generate = cast_with_native_amp(model.generate, accelerator.mixed_precision)
         
     # creating optimizer after setting up model b/c FSDP requires/recommends that
     opt = torch.optim.AdamW(
@@ -276,11 +245,6 @@ def main(
                     
                     step += 1
 
-        if (e + 1) % hparams.save_int == 0:
-            # save checkpoint
-            print('Saving checkpoint...')
-            accelerator.save_state(checkpoint_dir / f"epoch_{e+1}")
-
         ##### Evaluation loop #####
         if (e + 1) % hparams.eval_int == 0:
             model.eval()
@@ -332,6 +296,12 @@ def main(
                             with open(case_result_path, "w") as f:
                                 json.dump(metrics, f, indent=1)
                     pbar.update(1)
+
+        ##### Save checkpoint #####
+        if (e + 1) % hparams.save_int == 0:
+            # save checkpoint
+            print('Saving checkpoint...')
+            accelerator.save_state(checkpoint_dir / f"epoch_{e+1}")
 
     accelerator.end_training()
 

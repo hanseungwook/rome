@@ -3,6 +3,7 @@ import os
 import torch
 import torch.distributed as dist
 from accelerate import Accelerator
+from accelerate.utils import GradientAccumulationPlugin
 
 
 def is_main_process():
@@ -26,12 +27,15 @@ def gather_tensors_in_dict(tensor_dict):
     return gathered_dict
 
 
-def setup_distributed_training(model, tok, train_loader, eval_loader):
-    # Initialize the distributed backend
-    # dist.init_process_group(backend='nccl')
+def setup_distributed_training(model, tok, train_loader, eval_loader, hparams):
+
+    # if gradient accumulation > 1, enable it with plugin
+    ga_plugin = None
+    if hparams.gradient_accumulation_steps > 1:
+        ga_plugin = GradientAccumulationPlugin(num_steps=hparams.gradient_accumulation_steps, sync_each_batch=True) # sync recommended for fsdp
 
     # Create an instance of the Accelerator class
-    accelerator = Accelerator(log_with="wandb")
+    accelerator = Accelerator(log_with="wandb", gradient_accumulation_plugin=ga_plugin)
 
     # Set the device of the model and tokenizer
     model, tok, train_loader, eval_loader = accelerator.prepare(model, tok, train_loader, eval_loader)

@@ -154,7 +154,7 @@ def main(
     eval_loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False)
 
     # Call the setup_distributed_training function in the main function
-    accelerator, model, tok, train_loader, eval_loader = setup_distributed_training(model, tok, train_loader, eval_loader)
+    accelerator, model, tok, train_loader, eval_loader = setup_distributed_training(model, tok, train_loader, eval_loader, hparams)
 
     # Cast native autocast to generate function if using ModelWithRef
     if isinstance(model.module, ModelWithRef) and accelerator.mixed_precision in ('fp16', 'bf16'):
@@ -206,18 +206,19 @@ def main(
                     if conserve_memory
                     else dict()
                 )
-                # requested_rewrites = [record["requested_rewrite"] for record in batch]
-                log_dict = apply_algo(
-                    accelerator,
-                    model,
-                    opt,
-                    tok,
-                    batch['requested_rewrite'],
-                    hparams,
-                    copy=False,
-                    return_orig_weights=True,
-                    **args_conserve_memory,
-                )
+                with accelerator.accumulate(model):
+                    # requested_rewrites = [record["requested_rewrite"] for record in batch]
+                    log_dict = apply_algo(
+                        accelerator,
+                        model,
+                        opt,
+                        tok,
+                        batch['requested_rewrite'],
+                        hparams,
+                        copy=False,
+                        return_orig_weights=True,
+                        **args_conserve_memory,
+                    )
 
                 # gather tensors and log
                 gathered_log_dict = gather_tensors_in_dict(log_dict)

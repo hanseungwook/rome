@@ -39,4 +39,5 @@ class DPOHyperParams(HyperParams):
 
     # Defaults
     batch_size: int = 128
+    gradient_accumulation_steps: int = 1
     

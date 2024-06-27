@@ -121,7 +121,7 @@ def main(
 
     # if algo is DPO, then create ref_model as a copy and wrap with accelerator
     ref_model = None
-    if alg_name in ['DPO', 'FT']:
+    if alg_name in ['FT']:# ['DPO', 'FT']:
         ref_model = AutoModelForCausalLM.from_pretrained(model_name)        
         ref_model.eval()
 
@@ -153,12 +153,43 @@ def main(
     train_loader = torch.utils.data.DataLoader(ds, batch_size=hparams.batch_size, shuffle=True)
     eval_loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False)
 
+    # # Capture the environment variables
+    # if is_main_process():
+    #     import os
+    #     import pickle
+    #     # Path to the pickle file
+    #     pickle_file_path = 'env_vars.pkl'
+
+    #     if not os.path.exists(pickle_file_path):
+    #         # Capture the environment variables
+    #         env_vars = dict(os.environ)
+            
+    #         # Save the environment variables to a pickle file
+    #         with open(pickle_file_path, 'wb') as f:
+    #             pickle.dump(env_vars, f)
+    #         print("Environment variables saved to env_vars.pkl")
+    #     else:
+    #         # Load the environment variables from the pickle file
+    #         with open(pickle_file_path, 'rb') as f:
+    #             loaded_env_vars = pickle.load(f)
+            
+    #         # Update os.environ with the loaded environment variables
+    #         os.environ.update(loaded_env_vars)
+    #         print("Environment variables loaded from env_vars.pkl")
+
+    #         # Verify that the environment variables have been loaded
+    #         for key, value in loaded_env_vars.items():
+    #             print(f'{key}: {value}')
+
     # Call the setup_distributed_training function in the main function
     accelerator, model, tok, train_loader, eval_loader = setup_distributed_training(model, tok, train_loader, eval_loader, hparams)
+    # torch.distributed.breakpoint()
 
     # Cast native autocast to generate function if using ModelWithRef
     if isinstance(model.module, ModelWithRef) and accelerator.mixed_precision in ('fp16', 'bf16'):
-        model.generate = cast_with_native_amp(model.generate, accelerator.mixed_precision)
+        model.module.generate = cast_with_native_amp(model.module.generate, accelerator.mixed_precision)
+        model.model.generate = cast_with_native_amp(model.model.generate, accelerator.mixed_precision)
+        # model.generate = cast_with_native_amp(model.generate, accelerator.mixed_precision)
         print('Casting amp to generate fn')
         
     # creating optimizer after setting up model b/c FSDP requires/recommends that
@@ -179,8 +210,9 @@ def main(
     # Set up logging
     if accelerator.is_local_main_process:
         accelerator.init_trackers(
-            project_name="knowledge_injection",
+            project_name="knowledge-injection",
             config=asdict(hparams),
+            init_kwargs={"wandb": {"entity": "llm-alignment"}}
         )
 
     meters = None
@@ -206,19 +238,19 @@ def main(
                     if conserve_memory
                     else dict()
                 )
-                with accelerator.accumulate(model):
-                    # requested_rewrites = [record["requested_rewrite"] for record in batch]
-                    log_dict = apply_algo(
-                        accelerator,
-                        model,
-                        opt,
-                        tok,
-                        batch['requested_rewrite'],
-                        hparams,
-                        copy=False,
-                        return_orig_weights=True,
-                        **args_conserve_memory,
-                    )
+                # with accelerator.accumulate(model):
+                # requested_rewrites = [record["requested_rewrite"] for record in batch]
+                log_dict = apply_algo(
+                    accelerator,
+                    model,
+                    opt,
+                    tok,
+                    batch['requested_rewrite'],
+                    hparams,
+                    copy=False,
+                    return_orig_weights=True,
+                    **args_conserve_memory,
+                )
 
                 # gather tensors and log
                 gathered_log_dict = gather_tensors_in_dict(log_dict)
@@ -240,9 +272,6 @@ def main(
         if (e + 1) % hparams.save_int == 0:
             # save checkpoint
             print('Saving checkpoint...')
-            print('epoch is:', e+1)
-            print('rank is:', dist.get_rank())
-
             accelerator.save_state(checkpoint_dir / f"epoch_{e+1}")
 
         ##### Evaluation loop #####

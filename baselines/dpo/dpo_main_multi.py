@@ -115,18 +115,17 @@ def execute_dpo(
         'input_ids': chosen_tgt.to('cuda'),
         'attention_mask': chosen_attention_mask.to('cuda'),
     }
-    
+
     # unwrap model and generate from it
-    with torch.no_grad() and FSDP.summon_full_params(model, recurse=False, writeback=False):
-        # unwrapped_model = accelerator.unwrap_model(model)
-        # unwrapped_model.eval()
-        model.model.eval() if use_ref else model.eval()
+    with torch.no_grad():
+        with FSDP.summon_full_params(model, recurse=False, writeback=False):
+            # unwrapped_model = accelerator.unwrap_model(model)
+            # unwrapped_model.eval()
+            model.model.eval() if use_ref else model.eval()
+            # nucleus sampling -- gen = (bs * num_negatives, seq_len)
+            gen = model.generate(input_ids=prompt_inputs['input_ids'], pad_token_id=tok.pad_token_id, do_sample=True, top_p=0.95, top_k=50, num_return_sequences=hparams.num_negatives, max_new_tokens=20)
+            model.model.train() if use_ref else model.train()
 
-        # nucleus sampling -- gen = (bs * num_negatives, seq_len)
-        gen = model.generate(input_ids=prompt_inputs['input_ids'], pad_token_id=tok.pad_token_id, do_sample=True, top_p=0.95, top_k=50, num_return_sequences=hparams.num_negatives, max_new_tokens=20)
-
-        model.model.train() if use_ref else model.train()
-    
     # extract only responses (excluding prompt) and convert to tuple (for unique hashing)
     gen_ids = [tuple(o[prompt_inputs['input_ids'].shape[1]:].tolist()) for o in gen]
     gen_txt = tok.batch_decode(gen_ids, skip_special_tokens=True)
@@ -189,7 +188,6 @@ def execute_dpo(
     rejected_labels = rejected_inputs['input_ids'].clone()
     rejected_labels = rejected_labels.masked_fill(~rejected_inputs['attention_mask'].bool(), -100)
     rejected_labels[:, :prompt_lengths] = -100
-
     # get logits for chosen and rejected under current model
     current_chosen_logits = model(**chosen_inputs).logits
     current_rejected_logits = model(**rejected_inputs).logits
@@ -197,7 +195,6 @@ def execute_dpo(
         with torch.no_grad():
             ref_chosen_logits = model(ref=True, **chosen_inputs).logits
             ref_rejected_logits = model(ref=True, **rejected_inputs).logits
-
     # TODO: do this filtering out at the loss level (where it's 0 b/c chosen == generated)
     # get logp with the chosen and rejected labels
     chosen_logp_mask = chosen_labels != -100

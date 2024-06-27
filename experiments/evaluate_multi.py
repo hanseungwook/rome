@@ -129,6 +129,7 @@ def main(
     # if use_ref is True, then load reference model and wrap both models in 1 module
     ref_model = None
     if hasattr(hparams, 'use_ref') and hparams.use_ref is True:
+        print('Using reference model and wrapping!')
         ref_model = AutoModelForCausalLM.from_pretrained(model_name)
         ref_model.eval()
         model = ModelWithRef(model, ref_model)

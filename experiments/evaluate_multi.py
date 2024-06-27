@@ -2,6 +2,7 @@ import json
 import shutil
 from typing import Tuple, Union
 from itertools import chain
+from dataclasses import asdict
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -177,7 +178,10 @@ def main(
 
     # Set up logging
     if accelerator.is_local_main_process:
-        accelerator.init_trackers("knowledge_injection")
+        accelerator.init_trackers(
+            project_name="knowledge_injection",
+            config=asdict(hparams),
+        )
 
     meters = None
     if alg_name in ['DPO']:

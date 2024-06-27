@@ -12,6 +12,7 @@ class DPOHyperParams(HyperParams):
     epochs: int
     eval_int: int
     save_int: int
+    
     num_negatives: int
     lr: float
     weight_decay: float
@@ -20,21 +21,6 @@ class DPOHyperParams(HyperParams):
     beta: float
     label_smoothing: float
     use_ref: bool
-
-    # Sampling parameters
-    # num_samples: int
-    # top_p: float
-    # top_k: int
-    # temperature: float
-    # max_len: int
-
-    # Module templates
-    # rewrite_module_tmp: str
-    # layer_module_tmp: str
-    # mlp_module_tmp: str
-    # attn_module_tmp: str
-    # ln_f_module: str
-    # lm_head_module: str
 
     seed: int
 

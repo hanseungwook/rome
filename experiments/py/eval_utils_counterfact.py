@@ -124,10 +124,8 @@ def test_batch_prediction(
 
     a_tok, b_tok = (tok(f" {n}")["input_ids"] for n in [target_new, target_true])
     choice_a_len, choice_b_len = (len(n) for n in [a_tok, b_tok])
-    print('before fwd in test batch pred')
     with torch.no_grad():
         logits = model(**prompt_tok).logits
-    print('after fwd in test batch pred')
     results = np.zeros((logits.size(0),), dtype=np.float32)
 
     for i in range(logits.size(0)):

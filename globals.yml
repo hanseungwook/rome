@@ -1,6 +1,7 @@
 ---
   # Result files
   RESULTS_DIR: "/shiv/seungwook/knowledge-injection/results"
+  CHECKPOINT_DIR: "/new_data/seungwook/knowledge-injection/checkpoints"
 
   # Data files
   DATA_DIR: "data"

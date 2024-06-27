@@ -13,6 +13,7 @@ from util import nethook
 
 from .dpo_hparams import DPOHyperParams
 
+
 class ModelWithRef(torch.nn.Module):
     def __init__(self, model, ref_model):
         super().__init__()
@@ -24,7 +25,13 @@ class ModelWithRef(torch.nn.Module):
             return self.ref_model(*args, **kwargs)
         else:
             return self.model(*args, **kwargs)
-
+    
+    def generate(self, ref=False, *args, **kwargs):
+        if ref:
+            return self.ref_model.generate(*args, **kwargs)
+        else:
+            return self.model.generate(*args, **kwargs)
+        
 
 def print_grad(opt):
     for group in opt.param_groups:
@@ -34,7 +41,6 @@ def print_grad(opt):
 def apply_dpo_to_model(
     accelerator: Accelerator,
     model: AutoModelForCausalLM,
-    ref_model: AutoModelForCausalLM,
     opt: torch.optim.Optimizer,
     tok: AutoTokenizer,
     requests: List[Dict],
@@ -53,7 +59,7 @@ def apply_dpo_to_model(
     if copy:
         model = deepcopy(model)
 
-    log_dict = execute_dpo(accelerator, model, ref_model, opt, tok, requests, hparams)
+    log_dict = execute_dpo(accelerator, model, opt, tok, requests, hparams)
 
     return log_dict
 
@@ -61,7 +67,6 @@ def apply_dpo_to_model(
 def execute_dpo(
     accelerator: Accelerator,
     model: AutoModelForCausalLM,
-    ref_model: AutoModelForCausalLM,
     opt: torch.optim.Optimizer,
     tok: AutoTokenizer,
     requests: List[Dict],
@@ -73,23 +78,31 @@ def execute_dpo(
     Invariant: model at beginning of function == model at end of function
     """
 
+    # Boolean whether to use a reference model
+    use_ref = False
+    if isinstance(model.module, ModelWithRef):
+        use_ref = True
+
     # Update target and print info
     requests = deepcopy(requests)
     requests['target_new']['str'] = [" " + r for r in requests['target_new']['str'] if r[0] != " "]
-    print('Executing algo for: ')
-    for i in range(len(requests['prompt'])):
-        print(f"[{requests['prompt'][i].format(requests['subject'][i])}] -> [{requests['target_new']['str'][i]}]")
+
+    # DEBUG prints
+    # print('Executing algo for: ')
+    # for i in range(len(requests['prompt'])):
+    #     print(f"[{requests['prompt'][i].format(requests['subject'][i])}] -> [{requests['target_new']['str'][i]}]")
 
     # Define inputs
     texts = [prompt.format(subject) for prompt, subject in zip(requests['prompt'], requests['subject'])]
     targets = requests['target_new']['str']
     txt, tgt = texts, targets
 
-    chunk_bs = len(txt)
     prompt_inputs = tok(txt, return_tensors="pt", padding=True).to("cuda")
-    # chosen_tgt = tok(tgt, return_tensors="pt", padding=True).to("cuda")
 
-    chosen_tgt = [tok.encode(t, padding=False) + [tok.eos_token_id] for t in tgt]
+    if tok.add_bos_token:
+        chosen_tgt = [tok.encode(t, padding=False)[1:] + [tok.eos_token_id] for t in tgt]
+    else:
+        chosen_tgt = [tok.encode(t, padding=False) + [tok.eos_token_id] for t in tgt]
     chosen_tgt = [torch.tensor(t) for t in chosen_tgt]
     chosen_tgt = pad_sequence(chosen_tgt, batch_first=True, padding_value=tok.pad_token_id)
 
@@ -105,12 +118,14 @@ def execute_dpo(
     
     # unwrap model and generate from it
     with torch.no_grad() and FSDP.summon_full_params(model, recurse=False, writeback=False):
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.eval()
+        # unwrapped_model = accelerator.unwrap_model(model)
+        # unwrapped_model.eval()
+        model.model.eval() if use_ref else model.eval()
+
         # nucleus sampling -- gen = (bs * num_negatives, seq_len)
-        gen = unwrapped_model.generate(input_ids=prompt_inputs['input_ids'], do_sample=True, top_p=0.95, top_k=50, num_return_sequences=hparams.num_negatives, max_new_tokens=20)
-        unwrapped_model.train()
-        model.train()
+        gen = model.generate(input_ids=prompt_inputs['input_ids'], pad_token_id=tok.pad_token_id, do_sample=True, top_p=0.95, top_k=50, num_return_sequences=hparams.num_negatives, max_new_tokens=20)
+
+        model.model.train() if use_ref else model.train()
     
     # extract only responses (excluding prompt) and convert to tuple (for unique hashing)
     gen_ids = [tuple(o[prompt_inputs['input_ids'].shape[1]:].tolist()) for o in gen]
@@ -123,7 +138,7 @@ def execute_dpo(
         
         # If punctuation is found, truncate the string at that position
         if match:
-            result = s[:match.start()+1]
+            result = s[:match.start()]
         else:
             result = s  # No punctuation found, return the original string
         
@@ -132,7 +147,10 @@ def execute_dpo(
 
     trunc_gen_txt = list(map(truncate_at_first_punctuation, gen_txt))
     # tokenize this truncated text, add eos token, and pad to longest length
-    gen_tgt = [tok.encode(t, padding=False) + [tok.eos_token_id] for t in trunc_gen_txt]
+    if tok.add_bos_token:
+        gen_tgt = [tok.encode(t, padding=False)[1:] + [tok.eos_token_id] for t in trunc_gen_txt]
+    else:
+        gen_tgt = [tok.encode(t, padding=False) + [tok.eos_token_id] for t in trunc_gen_txt]
     gen_tgt = [torch.tensor(t) for t in gen_tgt]
     gen_tgt = pad_sequence(gen_tgt, batch_first=True, padding_value=tok.pad_token_id)
     
@@ -150,8 +168,6 @@ def execute_dpo(
         'input_ids': gen_tgt.to('cuda'),
         'attention_mask': gen_attention_mask.to('cuda'),
     }
-    
-    bs = gen_tgt.shape[0]
 
     # concatenate prompt with target (eos token already added)
     chosen_inputs = {
@@ -165,9 +181,8 @@ def execute_dpo(
 
     prompt_lengths = prompt_inputs['attention_mask'].shape[1] # constant prompt length (because left-padded)
 
-    # create labels for getting logprob
+    # create labels for getting logprob by putting -100 for prompt and padding
     chosen_labels = chosen_inputs['input_ids'].clone()
-    # put -100 for prompt and padding
     chosen_labels = chosen_labels.masked_fill(~chosen_inputs['attention_mask'].bool(), -100)
     chosen_labels[:, :prompt_lengths] = -100
 
@@ -178,9 +193,10 @@ def execute_dpo(
     # get logits for chosen and rejected under current model
     current_chosen_logits = model(**chosen_inputs).logits
     current_rejected_logits = model(**rejected_inputs).logits
-    # with torch.no_grad() and FSDP.summon_full_params(ref_model, recurse=False, writeback=False):
-        # ref_chosen_logits = ref_model(**chosen_inputs).logits
-        # ref_rejected_logits = ref_model(**rejected_inputs).logits
+    if use_ref:
+        with torch.no_grad():
+            ref_chosen_logits = model(ref=True, **chosen_inputs).logits
+            ref_rejected_logits = model(ref=True, **rejected_inputs).logits
 
     # TODO: do this filtering out at the loss level (where it's 0 b/c chosen == generated)
     # get logp with the chosen and rejected labels
@@ -193,18 +209,20 @@ def execute_dpo(
     current_chosen_logp = (current_chosen_logp * chosen_logp_mask).sum(-1)
     current_rejected_logp = torch.gather(F.log_softmax(current_rejected_logits, dim=-1), 2, rejected_labels.unsqueeze(2)).squeeze(2)
     current_rejected_logp = (current_rejected_logp * rejected_logp_mask).sum(-1)
-    # ref_chosen_logp = torch.gather(F.log_softmax(ref_chosen_logits, dim=-1), 2, chosen_labels.unsqueeze(2)).squeeze(2)
-    # ref_chosen_logp = (ref_chosen_logp * chosen_logp_mask).sum(-1)
-    # ref_rejected_logp = torch.gather(F.log_softmax(ref_rejected_logits, dim=-1), 2, rejected_labels.unsqueeze(2)).squeeze(2)
-    # ref_rejected_logp = (ref_rejected_logp * rejected_logp_mask).sum(-1)
 
-    current_logratios = current_chosen_logp.unsqueeze(1) - current_rejected_logp.reshape(-1, hparams.num_negatives)
-    # ref_logratios = ref_chosen_logp.unsqueeze(1) - ref_rejected_logp.reshape(-1, hparams.num_negatives)
+    if use_ref:
+        ref_chosen_logp = torch.gather(F.log_softmax(ref_chosen_logits, dim=-1), 2, chosen_labels.unsqueeze(2)).squeeze(2)
+        ref_chosen_logp = (ref_chosen_logp * chosen_logp_mask).sum(-1)
+        ref_rejected_logp = torch.gather(F.log_softmax(ref_rejected_logits, dim=-1), 2, rejected_labels.unsqueeze(2)).squeeze(2)
+        ref_rejected_logp = (ref_rejected_logp * rejected_logp_mask).sum(-1)
 
-    if ref_model is None:
+        ref_logratios = ref_chosen_logp.unsqueeze(1) - ref_rejected_logp.reshape(-1, hparams.num_negatives)
+    else:
         ref_logratios = 0.
         ref_chosen_logp = 0.
         ref_rejected_logp = 0.
+
+    current_logratios = current_chosen_logp.unsqueeze(1) - current_rejected_logp.reshape(-1, hparams.num_negatives)
     
     logits = current_logratios - ref_logratios
     # label_smoothing = 0 gives original DPO

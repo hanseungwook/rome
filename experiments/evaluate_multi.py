@@ -1,13 +1,9 @@
 import json
 import shutil
-from pathlib import Path
-from time import time
 from typing import Tuple, Union
-from copy import deepcopy
 from itertools import chain
 
 import torch
-import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import accelerate
@@ -15,7 +11,7 @@ from accelerate.utils import set_seed
 
 # from baselines.efk import EFKHyperParams, EfkRewriteExecutor
 from baselines.ft import FTHyperParams, apply_ft_to_model
-from baselines.dpo import DPOHyperParams, apply_dpo_to_model
+from baselines.dpo import DPOHyperParams, apply_dpo_to_model, ModelWithRef
 from baselines.kn import KNHyperParams, apply_kn_to_model
 from baselines.mend import MENDHyperParams, MendRewriteExecutor
 from dsets import (
@@ -31,6 +27,7 @@ from util import nethook
 from util.globals import *
 from util.metrics import AverageMeter
 from util.distributed import *
+from util.amp import cast_with_native_amp
 
 ALG_DICT = {
     "ROME": (ROMEHyperParams, apply_rome_to_model),
@@ -64,6 +61,7 @@ def main(
     # Determine run directory
     if continue_from_run is not None:
         run_dir = RESULTS_DIR / dir_name / continue_from_run
+        checkpoint_dir = CHECKPOINT_DIR / dir_name / continue_from_run
         assert (
             run_dir.exists()
         ), f"If continuing from run, {continue_from_run} must exist!"
@@ -80,17 +78,14 @@ def main(
             else:
                 run_id = 0
             run_dir = RESULTS_DIR / dir_name / f"run_{str(run_id).zfill(3)}"
+            checkpoint_dir = CHECKPOINT_DIR / dir_name / f"run_{str(run_id).zfill(3)}"
             run_dir.mkdir(parents=True, exist_ok=True)
-            print(f"Results will be stored at {run_dir}") if is_main_process() else None
-
-            # checkpoint directory
-            checkpoint_dir = run_dir / "checkpoints"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Results will be stored at {run_dir}") if is_main_process() else None
             print(f"Checkpoints will be stored at {checkpoint_dir}") if is_main_process() else None
         else:
             run_dir = None
             checkpoint_dir = None
-
 
     # Get run hyperparameters
     params_path = (
@@ -112,33 +107,38 @@ def main(
     # Instantiate vanilla model
     print("Instantiating model") if is_main_process else None
     if type(model_name) is str:
-        model = AutoModelForCausalLM.from_pretrained(model_name, token='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')
-        tok = AutoTokenizer.from_pretrained(model_name, token='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')
-        tok.pad_token = tok.eos_token
-        tok.pad_token_id = tok.eos_token_id
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+        tok = AutoTokenizer.from_pretrained(model_name)
+
+        if tok.pad_token is None or tok.pad_token_id is None:
+            tok.pad_token = tok.eos_token
+            tok.pad_token_id = tok.eos_token_id
+            
         tok.padding_side = "left" # for batch processing
     else:
         model, tok = model_name
 
-    # Retrieve weights that user desires to change
-    weights = {
-        n: p
-        for n, p in model.named_parameters()
-        for layer in hparams.layers
-        if hparams.rewrite_module_tmp.format(layer) in n
-    }
-    # Save old weights for future restoration
-    print(f"Weights to be updated: {list(weights.keys())}") if is_main_process() else None
+    # if algo is DPO, then create ref_model as a copy and wrap with accelerator
+    ref_model = None
+    if alg_name in ['DPO', 'FT']:
+        ref_model = AutoModelForCausalLM.from_pretrained(model_name)        
+        ref_model.eval()
 
-    # Configure optimizer / gradients
-    # opt = torch.optim.Adam(
-    #     [v for _, v in weights.items()],
-    #     lr=hparams.lr,
-    #     weight_decay=hparams.weight_decay,
-    # )
+    if ref_model is not None:
+        model = ModelWithRef(model, ref_model)
 
-    # for name, w in model.named_parameters():
-        # w.requires_grad = name in weights
+    if isinstance(model, ModelWithRef):
+        for w in model.model.parameters():
+            w.requires_grad = True
+        for w in model.ref_model.parameters():
+            w.requires_grad = False
+    else:
+        for w in model.parameters():
+            w.requires_grad = True
+    
+    # Weights that are being optimized
+    weights = [k for k, v in model.named_parameters() if v.requires_grad]
+    print(f"Weights to be updated: {weights}") if is_main_process() else None
 
     # Load data
     print("Loading dataset, attribute snippets, tf-idf data") if is_main_process() else None
@@ -155,12 +155,17 @@ def main(
     # Call the setup_distributed_training function in the main function
     accelerator, model, tok, train_loader, eval_loader = setup_distributed_training(model, tok, train_loader, eval_loader)
 
+    # Cast native autocast to generate function if using ModelWithRef
+    if isinstance(model.module, ModelWithRef) and accelerator.mixed_precision in ('fp16', 'bf16'):
+        model.generate = cast_with_native_amp(model.generate, accelerator.mixed_precision)
+        print('Casting amp to generate fn')
+        
+    # creating optimizer after setting up model b/c FSDP requires/recommends that
     opt = torch.optim.AdamW(
-        model.parameters(),
+        model.model.parameters() if isinstance(model, ModelWithRef) else model.parameters(),
         lr=hparams.lr,
         weight_decay=hparams.weight_decay,
     )
-
     opt = accelerator.prepare(opt)
 
     # Sync run_dir name across processes
@@ -173,13 +178,6 @@ def main(
     # Set up logging
     if accelerator.is_local_main_process:
         accelerator.init_trackers("knowledge_injection")
-
-    # if algo is DPO, then create ref_model as a copy and wrap with accelerator
-    ref_model = None
-    # if alg_name in ['DPO', 'FT']:
-    #     ref_model = AutoModelForCausalLM.from_pretrained(model_name)
-    #     accelerator.prepare(ref_model)
-    #     ref_model.eval()
 
     meters = None
     if alg_name in ['DPO']:
@@ -208,7 +206,6 @@ def main(
                 log_dict = apply_algo(
                     accelerator,
                     model,
-                    ref_model,
                     opt,
                     tok,
                     batch['requested_rewrite'],
@@ -235,15 +232,15 @@ def main(
                     
                     step += 1
 
-        # if (e + 1) % hparams.save_int == 0:
-        #     # save checkpoint
-        #     print('Saving checkpoint...')
-        #     print('epoch is:', e+1)
-        #     print('rank is:', dist.get_rank())
+        if (e + 1) % hparams.save_int == 0:
+            # save checkpoint
+            print('Saving checkpoint...')
+            print('epoch is:', e+1)
+            print('rank is:', dist.get_rank())
 
-        #     accelerator.save_state(checkpoint_dir / f"epoch_{e+1}")
+            accelerator.save_state(checkpoint_dir / f"epoch_{e+1}")
 
-        # Execute evaluation suite over the whole training set, but only on the main process
+        ##### Evaluation loop #####
         if (e + 1) % hparams.eval_int == 0:
             model.eval()
             # ref_model.eval()

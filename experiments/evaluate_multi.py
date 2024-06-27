@@ -56,6 +56,13 @@ def main(
     mixed_precision: str,
     dir_name: str,
 ):
+
+    # Check if the environment variable exists
+    if 'NCCL_BUFFSIZE' in os.environ:
+        # Unset (delete) the environment variable
+        del os.environ['NCCL_BUFFSIZE']
+        print(f"Environment variable NCCL_BUFFSIZE has been unset.")
+
     # Set algorithm-specific variables
     params_class, apply_algo = ALG_DICT[alg_name]
 

@@ -12,6 +12,6 @@
     "weight_decay": 0,
     "kl_factor": 0,
     "norm_constraint": false,
-    "use_ref": false,
+    "use_ref": true,
     "seed": 21
 }

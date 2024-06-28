@@ -53,7 +53,6 @@ def main(
     continue_from_run: str,
     skip_generation_tests: bool,
     conserve_memory: bool,
-    mixed_precision: str,
     dir_name: str,
 ):
 
@@ -129,7 +128,7 @@ def main(
     # if use_ref is True, then load reference model and wrap both models in 1 module
     ref_model = None
     if hasattr(hparams, 'use_ref') and hparams.use_ref is True:
-        print('Using reference model and wrapping!')
+        print('Using reference model and wrapping into 1 module')
         ref_model = AutoModelForCausalLM.from_pretrained(model_name)
         ref_model.eval()
         model = ModelWithRef(model, ref_model)
@@ -196,12 +195,13 @@ def main(
     if alg_name in ['DPO']:
         meters = {'loss': AverageMeter(), 'reward_acc': AverageMeter(), 'chosen_reward': AverageMeter(), 'rejected_reward': AverageMeter()}
     elif alg_name in ['FT']:
-        meters = {'loss': AverageMeter}
+        meters = {'loss': AverageMeter()}
     else:
         raise ValueError(f"Algorithm metrics {alg_name} not supported or implemented.")
 
     step = 0
-
+    # DEBUG
+    only_batch = None
     ##### Training loop #####
     for e in range(hparams.epochs):
         model.train()
@@ -217,6 +217,14 @@ def main(
                 )
                 # with accelerator.accumulate(model):
                 # requested_rewrites = [record["requested_rewrite"] for record in batch]
+
+                # DEBUG
+                # if step == 0:
+                #     import copy
+                #     only_batch = copy.deepcopy(batch)
+                # else:
+                #     batch = only_batch
+
                 log_dict = apply_algo(
                     accelerator,
                     model,
@@ -367,13 +375,7 @@ if __name__ == "__main__":
         help="Reduce memory usage during evaluation at the cost of a minor slowdown. "
         "Backs up model weights on CPU instead of GPU.",
     )
-    
-    parser.add_argument(
-        "--mixed_precision",
-        type=str,
-        default='no',
-        help="Enable mixed precision training.",
-    )
+
 
     parser.set_defaults(skip_generation_tests=False, conserve_memory=False)
     args = parser.parse_args()
@@ -387,6 +389,5 @@ if __name__ == "__main__":
         args.continue_from_run,
         args.skip_generation_tests,
         args.conserve_memory,
-        args.mixed_precision,
         dir_name=args.alg_name,
     )

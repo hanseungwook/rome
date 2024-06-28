@@ -1,16 +1,22 @@
 from copy import deepcopy
 from typing import Any, Dict, List, Tuple
 
+from accelerate import Accelerator
 import torch
+import torch.nn.functional as F
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from util import nethook
+from util import ModelWithRef
 
 from .ft_hparams import FTHyperParams
 
 
 def apply_ft_to_model(
+    accelerator: Accelerator,
     model: AutoModelForCausalLM,
+    opt: torch.optim.Optimizer,
     tok: AutoTokenizer,
     requests: List[Dict],
     hparams: FTHyperParams,
@@ -25,27 +31,18 @@ def apply_ft_to_model(
     :return: (1) the updated model, (2) the weights that changed
     """
 
-    weights_copy = {}
     if copy:
         model = deepcopy(model)
 
-    deltas = execute_ft(model, tok, requests, hparams)
+    log_dict = execute_ft(accelerator, model, opt, tok, requests, hparams)
 
-    with torch.no_grad():
-        for w_name, upd_matrix in deltas.items():
-            w = nethook.get_parameter(model, w_name)
-            if return_orig_weights and w_name not in weights_copy:
-                weights_copy[w_name] = w.detach().clone()
-
-            w[...] += upd_matrix
-
-    print(f"New weights successfully inserted into {list(deltas.keys())}")
-
-    return model, weights_copy
+    return log_dict
 
 
 def execute_ft(
+    accelerator: Accelerator,
     model: AutoModelForCausalLM,
+    opt: torch.optim.Optimizer,
     tok: AutoTokenizer,
     requests: List[Dict],
     hparams: FTHyperParams,
@@ -56,79 +53,89 @@ def execute_ft(
     Invariant: model at beginning of function == model at end of function
     """
 
+    # Boolean whether to use a reference model
+    use_ref = False
+    if isinstance(model.module, ModelWithRef):
+        use_ref = True
+
     # Update target and print info
     requests = deepcopy(requests)
-    for request in requests:
-        if request["target_new"]["str"][0] != " ":
-            # Space required for correct tokenization
-            request["target_new"]["str"] = " " + request["target_new"]["str"]
-        print(
-            f"Executing FT algo for: "
-            f"[{request['prompt'].format(request['subject'])}] -> [{request['target_new']['str']}]"
-        )
+    requests['target_new']['str'] = [" " + r for r in requests['target_new']['str'] if r[0] != " "]
 
+    # DEBUG prints
+    # print('Executing algo for: ')
+    for i in range(len(requests['prompt'])):
+        print(f"[{requests['prompt'][i].format(requests['subject'][i])}] -> [{requests['target_new']['str'][i]}]\n")
 
     # Define inputs
-    texts = [r["prompt"].format(r["subject"]) for r in requests]
-    targets = [r["target_new"]["str"] for r in requests]
+    texts = [prompt.format(subject) for prompt, subject in zip(requests['prompt'], requests['subject'])]
+    targets = requests['target_new']['str']
+    txt, tgt = texts, targets
 
-    # Update loop: intervene at layers simultaneously
-    loss_meter = AverageMeter()
-    for it in range(hparams.num_steps):
-        print(20 * "=")
-        print(f"Epoch: {it}")
-        print(20 * "=")
-        loss_meter.reset()
+    prompt_inputs = tok(txt, return_tensors="pt", padding=True).to("cuda")
+    prompt_lengths = prompt_inputs['attention_mask'].shape[1]
 
-        for txt, tgt in zip(
-            chunks(texts, hparams.batch_size), chunks(targets, hparams.batch_size)
-        ):
-            inputs = tok(txt, return_tensors="pt", padding=True).to("cuda")
-            target_ids = tok(tgt, return_tensors="pt", padding=True)["input_ids"].to(
-                "cuda"
-            )
-            last_token_inds = inputs["attention_mask"].sum(dim=1) - 1
-            loss_mask = target_ids != tok.unk_token_id
+    if tok.add_bos_token:
+        chosen_tgt = [tok.encode(t, padding=False)[1:] + [tok.eos_token_id] for t in tgt]
+    else:
+        chosen_tgt = [tok.encode(t, padding=False) + [tok.eos_token_id] for t in tgt]
+    chosen_tgt = [torch.tensor(t) for t in chosen_tgt]
+    chosen_tgt = pad_sequence(chosen_tgt, batch_first=True, padding_value=tok.pad_token_id)
 
-            opt.zero_grad()
-            bs = inputs["input_ids"].shape[0]
-            probs = torch.nn.functional.log_softmax(
-                model(**inputs).logits[torch.arange(bs), last_token_inds], dim=-1
-            )
-            loss = -(torch.gather(probs, 1, target_ids) * loss_mask).sum(
-                1
-            ) / loss_mask.sum(1)
-            loss = loss.mean()
-            print(f"Batch loss {loss.item()}")
-            loss_meter.update(loss.item(), n=bs)
-
-            if loss.item() >= 1e-2:
-                loss.backward()
-                opt.step()
-
-            if type(hparams.norm_constraint) is float:
-                eps = hparams.norm_constraint
-                with torch.no_grad():
-                    for k, v in weights.items():
-                        v[...] = torch.clamp(
-                            v, min=weights_copy[k] - eps, max=weights_copy[k] + eps
-                        )
-
-        print(f"Total loss {loss_meter.avg}")
-
-        if loss_meter.avg < 1e-2:
-            break
-
-    deltas = {k: (weights[k] - weights_copy[k]).detach() for k in weights}
-
-    # Restore state of original model
+    # unwrap model and generate from it
     with torch.no_grad():
-        for k, v in weights.items():
-            v[...] = weights_copy[k]
+        with FSDP.summon_full_params(model, recurse=False, writeback=False):
+            # unwrapped_model = accelerator.unwrap_model(model)
+            # unwrapped_model.eval()
+            model.model.eval() if use_ref else model.eval()
+            # nucleus sampling -- gen = (bs * num_negatives, seq_len)
+            gen = model.generate(input_ids=prompt_inputs['input_ids'], pad_token_id=tok.pad_token_id, do_sample=True, top_p=0.95, top_k=50, num_return_sequences=32, max_new_tokens=20)
+            model.model.train() if use_ref else model.train()
 
-    print(f"Deltas successfully computed for {list(weights.keys())}")
+    # extract only responses (excluding prompt) and convert to tuple (for unique hashing)
+    gen_ids = [tuple(o[prompt_inputs['input_ids'].shape[1]:].tolist()) for o in gen]
+    gen_txt = tok.batch_decode(gen_ids, skip_special_tokens=True)
 
-    return deltas
+    for i in range(len(gen_txt)):
+        print(f'PROMPT: {txt[i//32]}\t CHOSEN: {tgt[i//32]}\t GENERATED: {gen_txt[i]}\n')
+
+    # create attention mask for chosen targets
+    eos_token_idxs = ((chosen_tgt == tok.eos_token_id).cumsum(dim=1).cumsum(dim=1) == 1).argsort(dim=1)[:, -1]
+    mask = torch.arange(chosen_tgt.shape[1]).expand(chosen_tgt.shape[0], chosen_tgt.shape[1]) <= eos_token_idxs.unsqueeze(1)
+    chosen_attention_mask = torch.ones_like(chosen_tgt, dtype=torch.long) * mask
+
+    chosen_tgt = {
+        'input_ids': chosen_tgt.to('cuda'),
+        'attention_mask': chosen_attention_mask.to('cuda'),
+    }
+
+    # concatenate prompt with target (eos token already added?)
+    chosen_inputs = {
+        'input_ids': torch.cat([prompt_inputs['input_ids'], chosen_tgt['input_ids']], dim=1),
+        'attention_mask': torch.cat([prompt_inputs['attention_mask'], chosen_tgt['attention_mask']], dim=1)
+    }
+
+    # create labels for getting logprob by putting -100 for prompt and padding
+    chosen_labels = chosen_inputs['input_ids'].clone()
+    chosen_labels = chosen_labels.masked_fill(~chosen_inputs['attention_mask'].bool(), -100)
+    chosen_labels[:, :prompt_lengths] = -100
+    # shift by 1
+    chosen_labels = chosen_labels[:, 1:].clone()
+
+    current_chosen_logits = model(**chosen_inputs).logits
+    current_chosen_logits = current_chosen_logits[:, :-1] # excluding last token logits
+
+    chosen_logp_mask = chosen_labels != -100
+    chosen_labels[chosen_labels == -100] = 0 # dummy tokens
+    current_chosen_logp = torch.gather(F.log_softmax(current_chosen_logits, dim=-1), 2, chosen_labels.unsqueeze(2)).squeeze(2)
+    current_chosen_logp = (current_chosen_logp * chosen_logp_mask).sum(-1) / chosen_logp_mask.sum(-1) # average over tokens
+    loss = -current_chosen_logp.mean()
+
+    accelerator.backward(loss)
+    opt.step()
+    opt.zero_grad()
+
+    return {'loss': loss}
 
 
 def chunks(arr, n):
@@ -141,22 +148,3 @@ def chunks(arr, n):
             chunk = []
     if len(chunk) > 0:
         yield chunk
-
-
-class AverageMeter:
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count

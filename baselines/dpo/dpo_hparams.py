@@ -7,7 +7,6 @@ from util.hparams import HyperParams
 @dataclass
 class DPOHyperParams(HyperParams):
     # Method
-    # layers: List[int]
     num_steps: int
     epochs: int
     eval_int: int

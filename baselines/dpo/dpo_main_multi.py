@@ -9,29 +9,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from util import nethook
-
+from util import ModelWithRef
 from .dpo_hparams import DPOHyperParams
-
-
-class ModelWithRef(torch.nn.Module):
-    def __init__(self, model, ref_model):
-        super().__init__()
-        self.model = model
-        self.ref_model = ref_model
-
-    def forward(self, ref=False, *args, **kwargs):
-        if ref:
-            return self.ref_model(*args, **kwargs)
-        else:
-            return self.model(*args, **kwargs)
-    
-    def generate(self, ref=False, *args, **kwargs):
-        if ref:
-            return self.ref_model.generate(*args, **kwargs)
-        else:
-            return self.model.generate(*args, **kwargs)
-        
 
 def print_grad(opt):
     for group in opt.param_groups:
@@ -89,8 +68,8 @@ def execute_dpo(
 
     # DEBUG prints
     # print('Executing algo for: ')
-    # for i in range(len(requests['prompt'])):
-    #     print(f"[{requests['prompt'][i].format(requests['subject'][i])}] -> [{requests['target_new']['str'][i]}]")
+    for i in range(len(requests['prompt'])):
+        print(f"[{requests['prompt'][i].format(requests['subject'][i])}] -> [{requests['target_new']['str'][i]}]\n")
 
     # Define inputs
     texts = [prompt.format(subject) for prompt, subject in zip(requests['prompt'], requests['subject'])]
@@ -153,10 +132,8 @@ def execute_dpo(
     gen_tgt = [torch.tensor(t) for t in gen_tgt]
     gen_tgt = pad_sequence(gen_tgt, batch_first=True, padding_value=tok.pad_token_id)
     
-    # for i in range(len(trunc_gen_txt)):
-    #     print('PROMPT: ', txt[i//hparams.num_negatives])
-    #     print('CHOSEN: ', tgt[i//hparams.num_negatives])
-    #     print('GENERATED: ', trunc_gen_txt[i])
+    for i in range(len(trunc_gen_txt)):
+        print(f'PROMPT: {txt[i//hparams.num_negatives]}\t CHOSEN: {tgt[i//hparams.num_negatives]}\t GENERATED: {trunc_gen_txt[i]}\n')
 
     # create attention mask for generated targets
     eos_token_idxs = ((gen_tgt == tok.eos_token_id).cumsum(dim=1).cumsum(dim=1) == 1).argsort(dim=1)[:, -1]
@@ -188,6 +165,7 @@ def execute_dpo(
     rejected_labels = rejected_inputs['input_ids'].clone()
     rejected_labels = rejected_labels.masked_fill(~rejected_inputs['attention_mask'].bool(), -100)
     rejected_labels[:, :prompt_lengths] = -100
+    
     # get logits for chosen and rejected under current model
     current_chosen_logits = model(**chosen_inputs).logits
     current_rejected_logits = model(**rejected_inputs).logits
@@ -230,9 +208,9 @@ def execute_dpo(
     rejected_rewards = hparams.beta * (current_rejected_logp - ref_rejected_logp).detach()
     reward_accuracies = (chosen_rewards > rejected_rewards).float().mean()
 
-    opt.zero_grad()
     accelerator.backward(loss)
     opt.step()
+    opt.zero_grad()
 
     # TODO: skipping norm constraint 
     # if type(hparams.norm_constraint) is float:

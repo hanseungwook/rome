@@ -30,6 +30,15 @@ from util.metrics import AverageMeter
 from util.distributed import *
 from util.amp import cast_with_native_amp
 
+attn_implementation = ''
+try:
+    import flash_attn
+    attn_implementation = "flash_attention_2"
+    print('Enabling flash_attention_2')
+except ImportError:
+    attn_implementation = "spda"
+
+
 ALG_DICT = {
     "ROME": (ROMEHyperParams, apply_rome_to_model),
     "FT": (FTHyperParams, apply_ft_to_model),
@@ -114,7 +123,7 @@ def main(
     # Instantiate vanilla model
     print("Instantiating model") if is_main_process else None
     if type(model_name) is str:
-        model = AutoModelForCausalLM.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation=attn_implementation)
         tok = AutoTokenizer.from_pretrained(model_name)
 
         if tok.pad_token is None or tok.pad_token_id is None:
@@ -129,7 +138,7 @@ def main(
     ref_model = None
     if hasattr(hparams, 'use_ref') and hparams.use_ref is True:
         print('Using reference model and wrapping into 1 module')
-        ref_model = AutoModelForCausalLM.from_pretrained(model_name)
+        ref_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation=attn_implementation)
         ref_model.eval()
         model = ModelWithRef(model, ref_model)
 

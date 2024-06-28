@@ -1,0 +1,14 @@
+{
+    "epochs": 30,
+    "num_steps": 0,
+    "eval_int": 2,
+    "save_int": 1,
+    "batch_size": 16,
+    "gradient_accumulation_steps": 1,
+    "lr": 5e-4,
+    "weight_decay": 0,
+    "kl_factor": 0,
+    "norm_constraint": false,
+    "use_ref": false,
+    "seed": 21
+}

@@ -89,7 +89,7 @@ def execute_ft(
             # unwrapped_model.eval()
             model.model.eval() if use_ref else model.eval()
             # nucleus sampling -- gen = (bs * num_negatives, seq_len)
-            gen = model.generate(input_ids=prompt_inputs['input_ids'], pad_token_id=tok.pad_token_id, do_sample=True, top_p=0.95, top_k=50, num_return_sequences=32, max_new_tokens=20)
+            gen = model.generate(input_ids=prompt_inputs['input_ids'], pad_token_id=tok.pad_token_id, do_sample=True, top_p=0.95, top_k=50, num_return_sequences=1, max_new_tokens=20)
             model.model.train() if use_ref else model.train()
 
     # extract only responses (excluding prompt) and convert to tuple (for unique hashing)
@@ -97,7 +97,7 @@ def execute_ft(
     gen_txt = tok.batch_decode(gen_ids, skip_special_tokens=True)
 
     for i in range(len(gen_txt)):
-        print(f'PROMPT: {txt[i//32]}\t CHOSEN: {tgt[i//32]}\t GENERATED: {gen_txt[i]}\n')
+        print(f'PROMPT: {txt[i]}\t CHOSEN: {tgt[i]}\t GENERATED: {gen_txt[i]}\n')
 
     # create attention mask for chosen targets
     eos_token_idxs = ((chosen_tgt == tok.eos_token_id).cumsum(dim=1).cumsum(dim=1) == 1).argsort(dim=1)[:, -1]

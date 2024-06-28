@@ -1,5 +1,4 @@
 export PYTHONPATH="/home/lab/rome/:/home/lab/rome/"
-export WANDB_MODE="disabled"
 export TOKENIZERS_PARALLELISM="false"
 set -e NCCL_BUFFSIZE
 

@@ -30,14 +30,13 @@ from util.metrics import AverageMeter
 from util.distributed import *
 from util.amp import cast_with_native_amp
 
-attn_implementation = ''
+use_flash_attn = False
 try:
     import flash_attn
-    attn_implementation = "flash_attention_2"
-    print('Enabling flash_attention_2')
+    use_flash_attn = True
+    print('Enabling flash attention 2')
 except ImportError:
-    attn_implementation = "spda"
-
+    pass
 
 ALG_DICT = {
     "ROME": (ROMEHyperParams, apply_rome_to_model),

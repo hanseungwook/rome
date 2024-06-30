@@ -96,8 +96,9 @@ def execute_ft(
     gen_ids = [tuple(o[prompt_inputs['input_ids'].shape[1]:].tolist()) for o in gen]
     gen_txt = tok.batch_decode(gen_ids, skip_special_tokens=True)
 
-    for i in range(len(gen_txt)):
-        print(f'PROMPT: {txt[i]}\t CHOSEN: {tgt[i]}\t GENERATED: {gen_txt[i]}\n')
+    if accelerator.is_main_process:
+        for i in range(len(gen_txt)):
+            print(f'PROMPT: {txt[i]}\t CHOSEN: {tgt[i]}\t GENERATED: {gen_txt[i]}\n')
 
     # create attention mask for chosen targets
     eos_token_idxs = ((chosen_tgt == tok.eos_token_id).cumsum(dim=1).cumsum(dim=1) == 1).argsort(dim=1)[:, -1]

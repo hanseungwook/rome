@@ -53,19 +53,14 @@ def execute_ft(
     Invariant: model at beginning of function == model at end of function
     """
 
-    # Boolean whether to use a reference model
-    use_ref = False
-    if isinstance(model.module, ModelWithRef):
-        use_ref = True
-
     # Update target and print info
     requests = deepcopy(requests)
     requests['target_new']['str'] = [" " + r for r in requests['target_new']['str'] if r[0] != " "]
 
     # DEBUG prints
     # print('Executing algo for: ')
-    for i in range(len(requests['prompt'])):
-        print(f"[{requests['prompt'][i].format(requests['subject'][i])}] -> [{requests['target_new']['str'][i]}]\n")
+    # for i in range(len(requests['prompt'])):
+    #     print(f"[{requests['prompt'][i].format(requests['subject'][i])}] -> [{requests['target_new']['str'][i]}]\n")
 
     # Define inputs
     texts = [prompt.format(subject) for prompt, subject in zip(requests['prompt'], requests['subject'])]
@@ -87,18 +82,17 @@ def execute_ft(
         with FSDP.summon_full_params(model, recurse=False, writeback=False):
             # unwrapped_model = accelerator.unwrap_model(model)
             # unwrapped_model.eval()
-            model.model.eval() if use_ref else model.eval()
+            model.eval()
             # nucleus sampling -- gen = (bs * num_negatives, seq_len)
             gen = model.generate(input_ids=prompt_inputs['input_ids'], pad_token_id=tok.pad_token_id, do_sample=True, top_p=0.95, top_k=50, num_return_sequences=1, max_new_tokens=20)
-            model.model.train() if use_ref else model.train()
+            model.train()
 
-    # extract only responses (excluding prompt) and convert to tuple (for unique hashing)
+    # # extract only responses (excluding prompt) and convert to tuple (for unique hashing)
     gen_ids = [tuple(o[prompt_inputs['input_ids'].shape[1]:].tolist()) for o in gen]
     gen_txt = tok.batch_decode(gen_ids, skip_special_tokens=True)
 
-    if accelerator.is_main_process:
-        for i in range(len(gen_txt)):
-            print(f'PROMPT: {txt[i]}\t CHOSEN: {tgt[i]}\t GENERATED: {gen_txt[i]}\n')
+    for i in range(len(gen_txt)):
+        print(f'PROMPT: {txt[i]}\t CHOSEN: {tgt[i]}\t GENERATED: {gen_txt[i]}\n')
 
     # create attention mask for chosen targets
     eos_token_idxs = ((chosen_tgt == tok.eos_token_id).cumsum(dim=1).cumsum(dim=1) == 1).argsort(dim=1)[:, -1]
@@ -137,6 +131,7 @@ def execute_ft(
     opt.zero_grad()
 
     return {'loss': loss}
+
 
 
 def chunks(arr, n):

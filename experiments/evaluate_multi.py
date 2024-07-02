@@ -3,8 +3,12 @@ import shutil
 from typing import Tuple, Union
 from itertools import chain
 from dataclasses import asdict
+from copy import deepcopy
 
 import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import accelerate
@@ -34,7 +38,7 @@ use_flash_attn = False
 try:
     import flash_attn
     use_flash_attn = True
-    print('Enabling flash attention 2')
+    print('Enabling flash attention 2') if is_main_process() else None
 except ImportError:
     pass
 
@@ -60,6 +64,7 @@ def main(
     dataset_size_limit: int,
     continue_from_run: str,
     skip_generation_tests: bool,
+    generate: bool,
     conserve_memory: bool,
     dir_name: str,
 ):
@@ -122,7 +127,7 @@ def main(
     # Instantiate vanilla model
     print("Instantiating model") if is_main_process else None
     if type(model_name) is str:
-        model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation=attn_implementation)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
         tok = AutoTokenizer.from_pretrained(model_name)
 
         if tok.pad_token is None or tok.pad_token_id is None:
@@ -137,7 +142,7 @@ def main(
     ref_model = None
     if hasattr(hparams, 'use_ref') and hparams.use_ref is True:
         print('Using reference model and wrapping into 1 module')
-        ref_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation=attn_implementation)
+        ref_model = AutoModelForCausalLM.from_pretrained(model_name)
         ref_model.eval()
         model = ModelWithRef(model, ref_model)
 
@@ -163,7 +168,7 @@ def main(
     ds = ds_class(DATA_DIR, size=dataset_size_limit, tok=tok)
     
     # Create data loader
-    train_loader = torch.utils.data.DataLoader(ds, batch_size=hparams.batch_size, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(ds, batch_size=hparams.batch_size, shuffle=True, drop_last=True)
     eval_loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False)
 
     # Call the setup_distributed_training function in the main function
@@ -191,6 +196,18 @@ def main(
     checkpoint_dir = sync_run_dir[1]
     print(f'Synced dir names across processes: run_dir {run_dir}\tcheckpoint_dir {checkpoint_dir} ') if is_main_process() else None
 
+    # Load from checkpoint if resuming
+    if continue_from_run is not None:
+        # figure out the latest epoch checkpoint within this directory
+        id_list = [
+            int(str(x).split("_")[-1]) for x in checkpoint_dir.iterdir() if str(x).split("_")[-1].isnumeric()
+        ]
+        assert id_list, f"Checkpoint directory {checkpoint_dir} is empty!"
+        epoch_id = 'epoch_' + str(max(id_list))
+        print(f"Loading from checkpoint {checkpoint_dir / epoch_id}") if is_main_process() else None
+        accelerator.load_state(checkpoint_dir / epoch_id)
+        print('Loaded from checkpoint') if is_main_process() else None
+
     # Set up logging
     if accelerator.is_local_main_process:
         accelerator.init_trackers(
@@ -201,7 +218,7 @@ def main(
 
     meters = None
     if alg_name in ['DPO']:
-        meters = {'loss': AverageMeter(), 'reward_acc': AverageMeter(), 'chosen_reward': AverageMeter(), 'rejected_reward': AverageMeter()}
+        meters = {'loss': AverageMeter(), 'reward_acc': AverageMeter(), 'chosen_reward': AverageMeter(), 'rejected_reward': AverageMeter(), 'margin': AverageMeter()}
     elif alg_name in ['FT']:
         meters = {'loss': AverageMeter()}
     else:
@@ -209,7 +226,8 @@ def main(
 
     step = 0
     # DEBUG
-    only_batch = None
+    # only_batch = None
+
     ##### Training loop #####
     for e in range(hparams.epochs):
         model.train()
@@ -223,8 +241,7 @@ def main(
                     if conserve_memory
                     else dict()
                 )
-                # with accelerator.accumulate(model):
-                # requested_rewrites = [record["requested_rewrite"] for record in batch]
+                
 
                 # DEBUG
                 # if step == 0:
@@ -233,17 +250,18 @@ def main(
                 # else:
                 #     batch = only_batch
 
-                log_dict = apply_algo(
-                    accelerator,
-                    model,
-                    opt,
-                    tok,
-                    batch['requested_rewrite'],
-                    hparams,
-                    copy=False,
-                    return_orig_weights=True,
-                    **args_conserve_memory,
-                )
+                with accelerator.accumulate(model):
+                    log_dict = apply_algo(
+                        accelerator,
+                        model,
+                        opt,
+                        tok,
+                        batch['requested_rewrite'],
+                        hparams,
+                        copy=False,
+                        return_orig_weights=True,
+                        **args_conserve_memory,
+                    )
 
                 # gather tensors and log
                 gathered_log_dict = gather_tensors_in_dict(log_dict)
@@ -261,12 +279,16 @@ def main(
                     pbar.set_postfix({f'running {k}': v.avg for k, v in meters.items()})
                     
                     step += 1
+            
+        print(f'Completed training epoch... waiting for everyone at rank {dist.get_rank()}')
+
+        accelerator.wait_for_everyone()
 
         ##### Evaluation loop #####
         if (e + 1) % hparams.eval_int == 0:
             model.eval()
             # ref_model.eval()
-            cur_run_dir = run_dir / f"epoch_{e}"
+            cur_run_dir = run_dir / f"epoch_{e+1}"
 
             # set up current run dir for the epoch
             if accelerator.is_local_main_process:    
@@ -314,11 +336,15 @@ def main(
                                 json.dump(metrics, f, indent=1)
                     pbar.update(1)
 
+        print(f'After eval loop... waiting for everyone at rank {dist.get_rank()}')
+        accelerator.wait_for_everyone()
         ##### Save checkpoint #####
         if (e + 1) % hparams.save_int == 0:
             # save checkpoint
             print('Saving checkpoint...')
             accelerator.save_state(checkpoint_dir / f"epoch_{e+1}")
+        
+        print(f'After saving... waiting for everyone at rank {dist.get_rank()}')
 
     accelerator.end_training()
 
@@ -377,6 +403,13 @@ if __name__ == "__main__":
         "Useful for quick debugging and hyperparameter sweeps.",
     )
     parser.add_argument(
+        "--generate",
+        dest="generate",
+        action="store_true",
+        default=False,
+        help="Run generation tests",
+    )
+    parser.add_argument(
         "--conserve_memory",
         dest="conserve_memory",
         action="store_true",
@@ -396,6 +429,7 @@ if __name__ == "__main__":
         args.dataset_size_limit,
         args.continue_from_run,
         args.skip_generation_tests,
+        args.generate,
         args.conserve_memory,
         dir_name=args.alg_name,
     )

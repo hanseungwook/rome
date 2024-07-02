@@ -3,7 +3,7 @@
     "num_steps": 0,
     "eval_int": 2,
     "save_int": 1,
-    "batch_size": 16,
+    "batch_size": 4,
     "gradient_accumulation_steps": 1,
     "lr": 5e-4,
     "weight_decay": 0,

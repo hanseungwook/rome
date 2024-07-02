@@ -99,7 +99,7 @@ def compute_rewrite_quality_counterfact(
     #     )
     #     ret.update(gen_stats)
 
-    # return ret
+    return ret
 
 
 def test_batch_prediction(

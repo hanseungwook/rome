@@ -161,18 +161,26 @@ def execute_dpo(
     chosen_labels = chosen_inputs['input_ids'].clone()
     chosen_labels = chosen_labels.masked_fill(~chosen_inputs['attention_mask'].bool(), -100)
     chosen_labels[:, :prompt_lengths] = -100
+    # shift by 1
+    chosen_labels = chosen_labels[:, 1:].clone()
 
     rejected_labels = rejected_inputs['input_ids'].clone()
     rejected_labels = rejected_labels.masked_fill(~rejected_inputs['attention_mask'].bool(), -100)
     rejected_labels[:, :prompt_lengths] = -100
+    # shift by 1
+    rejected_labels = rejected_labels[:, 1:].clone()
     
     # get logits for chosen and rejected under current model
     current_chosen_logits = model(**chosen_inputs).logits
+    current_chosen_logits = current_chosen_logits[:, :-1] # excluding last token logits
     current_rejected_logits = model(**rejected_inputs).logits
+    current_rejected_logits = current_rejected_logits[:, :-1]
     if use_ref:
         with torch.no_grad():
             ref_chosen_logits = model(ref=True, **chosen_inputs).logits
+            ref_chosen_logits = ref_chosen_logits[:, :-1]
             ref_rejected_logits = model(ref=True, **rejected_inputs).logits
+            ref_rejected_logits = ref_rejected_logits[:, :-1]
     # TODO: do this filtering out at the loss level (where it's 0 b/c chosen == generated)
     # get logp with the chosen and rejected labels
     chosen_logp_mask = chosen_labels != -100
@@ -212,19 +220,11 @@ def execute_dpo(
     opt.step()
     opt.zero_grad()
 
-    # TODO: skipping norm constraint 
-    # if type(hparams.norm_constraint) is float:
-    #     eps = hparams.norm_constraint
-    #     with torch.no_grad():
-    #         for k, v in weights.items():
-    #             v[...] = torch.clamp(
-    #                 v, min=weights_copy[k] - eps, max=weights_copy[k] + eps
-    #             )
-
     return {'loss': loss, 
             'reward_acc': reward_accuracies.mean(),
             'chosen_reward': chosen_rewards.mean(),
             'rejected_reward': rejected_rewards.mean(),
+            'margin': (chosen_rewards - rejected_rewards).mean(),
             }
 
 

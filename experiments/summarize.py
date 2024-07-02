@@ -20,6 +20,7 @@ def main(
     uncompressed = []
 
     for run_dir in (RESULTS_DIR / dir_name if not abs_path else dir_name).iterdir():
+        print(run_dir)
         # Skip if we're not interested
         if runs is not None and all(run not in str(run_dir) for run in runs):
             continue
@@ -174,6 +175,12 @@ if __name__ == "__main__":
         default=None,
         help="Restricts evaluation to first n cases in dataset. "
         "Useful for comparing different in-progress runs on the same slice of data.",
+    )
+    parser.add_argument(
+        "--abs_path",
+        action="store_true",
+        default=False,
+        help="If specified, <dir_name> is treated as an absolute path"
     )
     args = parser.parse_args()
 

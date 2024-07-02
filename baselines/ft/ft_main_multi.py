@@ -78,14 +78,14 @@ def execute_ft(
     chosen_tgt = pad_sequence(chosen_tgt, batch_first=True, padding_value=tok.pad_token_id)
 
     # unwrap model and generate from it
-    with torch.no_grad():
-        with FSDP.summon_full_params(model, recurse=False, writeback=False):
-            # unwrapped_model = accelerator.unwrap_model(model)
-            # unwrapped_model.eval()
-            model.eval()
-            # nucleus sampling -- gen = (bs * num_negatives, seq_len)
-            gen = model.generate(input_ids=prompt_inputs['input_ids'], pad_token_id=tok.pad_token_id, do_sample=True, top_p=0.95, top_k=50, num_return_sequences=1, max_new_tokens=20)
-            model.train()
+    # with torch.no_grad():
+    #     with FSDP.summon_full_params(model, recurse=False, writeback=False):
+    #         # unwrapped_model = accelerator.unwrap_model(model)
+    #         # unwrapped_model.eval()
+    #         model.eval()
+    #         # nucleus sampling -- gen = (bs * num_negatives, seq_len)
+    #         gen = model.generate(input_ids=prompt_inputs['input_ids'], pad_token_id=tok.pad_token_id, do_sample=True, top_p=0.95, top_k=50, num_return_sequences=1, max_new_tokens=20)
+    #         model.train()
 
     # # extract only responses (excluding prompt) and convert to tuple (for unique hashing)
     gen_ids = [tuple(o[prompt_inputs['input_ids'].shape[1]:].tolist()) for o in gen]
